@@ -1852,6 +1852,7 @@ export async function apiAdminUpdateUserSubscription(
   userId: string,
   payload: {
     status?: BillingSubscriptionStatus;
+    action?: 'unblock';
     addDays?: number;
     role?: 'admin' | 'user';
     autoRenew?: boolean;

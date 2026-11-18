@@ -65,6 +65,7 @@ interface OverviewDashboardProps {
   onRenameCamera?: (camera: CameraItem, newName: string) => Promise<void> | void;
   onNotice: (msg: string) => void;
   isRestricted?: boolean;
+  restrictionMode?: 'none' | 'no_funds' | 'full_blocked';
 }
 
 interface TimelineRow {
@@ -109,10 +110,38 @@ function formatDayShort(ms: number): string {
   return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
 }
 
+function formatRub(amount: number): string {
+  const n = Number(amount || 0);
+  if (!Number.isFinite(n)) return '0';
+  return Math.abs(n - Math.round(n)) < 0.005 ? String(Math.round(n)) : n.toFixed(2);
+}
+
 function isGateLike(name: string, kind?: string): boolean {
   if (kind === 'gate' || kind === 'barrier') return true;
   const n = name.toLowerCase();
   return n.includes('ворот') || n.includes('калитк') || n.includes('шлагбаум');
+}
+
+function isGateOnlyLock(lock: LockItem, linkedCam?: CameraItem | null): boolean {
+  if (
+    lock.controllerType === 'esp32' ||
+    lock.entranceId?.startsWith('esp32_gate_') ||
+    lock.accessControlId === '990001' ||
+    lock.accessControlId === '990002' ||
+    lock.kind === 'barrier'
+  ) {
+    return true;
+  }
+  const origName = String(linkedCam?.originalName || lock.name || '').toLowerCase();
+  if (lock.kind === 'gate' && !origName.includes('калитк')) return true;
+  return /ворот|шлагбаум|фасад/.test(origName);
+}
+
+function isEntranceOrWicketCamera(cam: CameraItem): boolean {
+  const orig = String(cam.originalName || cam.name || '').toLowerCase();
+  if (/фасад|ворот|шлагбаум/.test(orig)) return false;
+  if (cam.source === 'intercom') return true;
+  return /калитк|подъезд|домофон|входная|\(\s*п\.?\s*\d+\s*\)|\bп\.\s*\d+\b/.test(orig);
 }
 
 function getPrimaryCameraRank(cam: CameraItem, linkedLock: LockItem | null): number {
@@ -176,7 +205,14 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   onRenameCamera,
   onNotice,
   isRestricted = false,
+  restrictionMode,
 }) => {
+  const effectiveMode: 'none' | 'no_funds' | 'full_blocked' =
+    restrictionMode ?? (isRestricted ? 'full_blocked' : 'none');
+  const isFullBlocked = effectiveMode === 'full_blocked';
+  const isNoFundsLimited = effectiveMode === 'no_funds';
+  const effectiveRestricted = isFullBlocked || isNoFundsLimited;
+
   const [selectedCameraId, setSelectedCameraId] = useState<string>('');
   const [liveStreamActive, setLiveStreamActive] = useState<boolean>(false);
   const [fullscreenOpen, setFullscreenOpen] = useState<boolean>(false);
@@ -204,6 +240,43 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
       );
     };
   }, [locks]);
+
+  const findLinkedCameraForLock = useMemo(() => {
+    return (lock: LockItem | null): CameraItem | null => {
+      if (!lock) return null;
+      return (
+        cameras.find(
+          (c) =>
+            (lock.externalCameraId && c.id === lock.externalCameraId) ||
+            (lock.entranceId &&
+              c.entranceId === lock.entranceId &&
+              c.placeId === lock.placeId) ||
+            (!lock.entranceId &&
+              lock.accessControlId &&
+              c.accessControlId === lock.accessControlId &&
+              c.placeId === lock.placeId)
+        ) || null
+      );
+    };
+  }, [cameras]);
+
+  const canOpenLockItem = (lock: LockItem | null): boolean => {
+    if (!lock || !lock.openable) return false;
+    if (isFullBlocked) return false;
+    if (isNoFundsLimited) {
+      return !isGateOnlyLock(lock, findLinkedCameraForLock(lock));
+    }
+    return true;
+  };
+
+  const canViewArchiveCam = (cam: CameraItem | null): boolean => {
+    if (!cam) return false;
+    if (isFullBlocked) return false;
+    if (isNoFundsLimited) {
+      return !isEntranceOrWicketCamera(cam);
+    }
+    return true;
+  };
 
   // The 5 main cameras: 2 калитки, сам подъезд, and 2 ворота ("Камера фасад 1" & "Камера фасад 2")
   const primaryCameras: CameraItem[] = useMemo(() => {
@@ -333,33 +406,47 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   const timelineRows: TimelineRow[] = useMemo(() => {
     const rows: TimelineRow[] = [];
 
-    const hasMatchedCameraForHistory = (ev: HistoryEventItem): boolean => {
-      if (cameras.length === 0) return false;
-      if (ev.cameraId && cameras.some((c) => c.id === ev.cameraId)) return true;
-      if (ev.sourceType === 'CAMERA' && cameras.some((c) => c.id === ev.sourceId)) return true;
-      if (
-        ev.entranceId &&
-        cameras.some((c) => c.entranceId === ev.entranceId && c.placeId === ev.placeId)
-      ) {
-        return true;
+    const matchCameraForHistory = (ev: HistoryEventItem): CameraItem | null => {
+      if (cameras.length === 0) return null;
+      if (ev.cameraId) {
+        const direct = cameras.find((c) => c.id === ev.cameraId);
+        if (direct) return direct;
       }
-      if (
-        ev.accessControlId &&
-        cameras.some((c) => c.accessControlId === ev.accessControlId && c.placeId === ev.placeId)
-      ) {
-        return true;
+      if (ev.sourceType === 'CAMERA') {
+        const bySrc = cameras.find((c) => c.id === ev.sourceId);
+        if (bySrc) return bySrc;
+      }
+      if (ev.entranceId) {
+        const byEnt = cameras.find(
+          (c) => c.entranceId === ev.entranceId && c.placeId === ev.placeId
+        );
+        if (byEnt) return byEnt;
+      }
+      if (ev.accessControlId) {
+        const byAc = cameras.find(
+          (c) => c.accessControlId === ev.accessControlId && c.placeId === ev.placeId
+        );
+        if (byAc) return byAc;
       }
       const msgLower = ev.message.toLowerCase();
-      if (
-        cameras.some(
-          (c) =>
-            msgLower.includes(c.name.toLowerCase()) ||
-            (c.originalName ? msgLower.includes(c.originalName.toLowerCase()) : false)
-        )
-      ) {
-        return true;
+      const byName = cameras.find(
+        (c) =>
+          msgLower.includes(c.name.toLowerCase()) ||
+          (c.originalName ? msgLower.includes(c.originalName.toLowerCase()) : false)
+      );
+      if (byName) return byName;
+      return null;
+    };
+
+    const hasMatchedCameraForHistory = (ev: HistoryEventItem): boolean => {
+      if (cameras.length === 0) return false;
+      const matched = matchCameraForHistory(ev);
+      if (matched) {
+        return !isFullBlocked && (!isNoFundsLimited || !isEntranceOrWicketCamera(matched));
       }
+      if (isNoFundsLimited) return false;
       // Fallback: calls / door openings at an address with cameras
+      const msgLower = ev.message.toLowerCase();
       const etLower = ev.eventType.toLowerCase();
       return (
         msgLower.includes('вызов') ||
@@ -373,6 +460,13 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
     for (const log of doorLogs) {
       const tsMs = normalizeTsMs(log.timestamp);
       const gate = isGateLike(log.lockName);
+      const logLock = locks.find((l) => l.id === log.lockId) || null;
+      const linkedCam = findLinkedCameraForLock(logLock);
+      const canPlayLog =
+        log.status === 'success' &&
+        cameras.length > 0 &&
+        !isFullBlocked &&
+        (!isNoFundsLimited || (linkedCam ? !isEntranceOrWicketCamera(linkedCam) : false));
       rows.push({
         id: `door_${log.id}`,
         tsMs,
@@ -385,7 +479,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             : `${gate ? 'Открыты ворота/калитка' : 'Открыта дверь'}: ${log.lockName}`,
         subtitle: log.placeAddress || log.message,
         doorLog: log,
-        playable: log.status === 'success' && cameras.length > 0,
+        playable: canPlayLog,
       });
     }
 
@@ -414,7 +508,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
 
     rows.sort((a, b) => b.tsMs - a.tsMs);
     return rows;
-  }, [cameras, doorLogs, placeHistory, places, selectedPlaceId]);
+  }, [cameras, doorLogs, placeHistory, places, selectedPlaceId, locks, findLinkedCameraForLock, isFullBlocked, isNoFundsLimited]);
 
   const handleCaptureSnapshot = () => {
     if (!resolvedSnapshotUrl) {
@@ -608,7 +702,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                           <Play className="w-3 h-3 fill-current text-[#3B82F6]" />
                           <span>Эфир</span>
                         </span>
-                        {!isRestricted && (
+                        {canViewArchiveCam(cam) && (
                           <button
                             type="button"
                             onClick={(e) => {
@@ -645,7 +739,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                       </div>
                     </div>
 
-                    {!isRestricted && linkedLock && linkedLock.openable ? (
+                    {linkedLock && canOpenLockItem(linkedLock) ? (
                       <button
                         type="button"
                         disabled={isUnlocking}
@@ -701,7 +795,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
           <div className="px-4 sm:px-5 py-3.5 border-b border-slate-100 dark:border-white/[0.06] flex flex-wrap items-center justify-between gap-2.5">
             <div className="flex items-center gap-2 min-w-0 flex-1">
               <CctvCameraIcon className="w-4 h-4 text-[#2563EB] dark:text-[#3B82F6] shrink-0" />
-              {isEditingActiveName && activeCamera ? (
+              {isEditingActiveName && !effectiveRestricted && activeCamera ? (
                 <form
                   onSubmit={handleSaveActiveRename}
                   className="flex items-center gap-1.5 flex-1 min-w-0 max-w-md"
@@ -774,7 +868,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                       {activeCamera?.name || 'Нет подключённых камер'}
                     </span>
                   )}
-                  {onRenameCamera && activeCamera && (
+                  {onRenameCamera && !effectiveRestricted && activeCamera && (
                     <button
                       type="button"
                       onClick={() => {
@@ -792,7 +886,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
-              {!isRestricted && linkedLockForActiveCamera && linkedLockForActiveCamera.openable && (
+              {linkedLockForActiveCamera && canOpenLockItem(linkedLockForActiveCamera) && (
                 <button
                   type="button"
                   disabled={Boolean(unlockingMap[linkedLockForActiveCamera.id])}
@@ -817,7 +911,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 </button>
               )}
 
-              {!isRestricted && activeCamera && (
+              {activeCamera && canViewArchiveCam(activeCamera) && (
                 <button
                   type="button"
                   onClick={() => onNavigateCameraArchive(activeCamera)}
@@ -933,7 +1027,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 Калитки, подъезд и ворота
               </p>
             </div>
-            {!isRestricted && (
+            {!effectiveRestricted && (
               <button
                 type="button"
                 onClick={onNavigateAccess}
@@ -945,17 +1039,17 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             )}
           </div>
 
-          {isRestricted ? (
+          {isFullBlocked ? (
             <div className="flex-1 p-6 flex flex-col items-center justify-center text-center gap-3">
-              <div className="w-11 h-11 rounded-2xl bg-amber-500/10 text-amber-500 flex items-center justify-center">
+              <div className="w-11 h-11 rounded-2xl bg-rose-500/10 text-rose-500 flex items-center justify-center">
                 <Lock className="w-5 h-5" />
               </div>
               <div className="space-y-1 max-w-xs">
                 <div className="text-sm font-bold text-slate-900 dark:text-white">
-                  Открытие дверей и ворот заблокировано
+                  Аккаунт полностью заблокирован
                 </div>
                 <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                  При неоплаченной или заблокированной подписке доступен только онлайн-просмотр камер.
+                  Открытие подъездов, калиток и ворот отключено администратором. Доступен только онлайн-просмотр камер.
                 </p>
               </div>
               <button
@@ -963,7 +1057,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 onClick={onNavigateSettings}
                 className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer"
               >
-                Оплатить подписку
+                Подробнее
               </button>
             </div>
           ) : (
@@ -980,23 +1074,13 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                   const isEsp32 =
                     lock.controllerType === 'esp32' ||
                     lock.entranceId?.startsWith('esp32_gate_');
-                  const linkedCam =
-                    cameras.find(
-                      (c) =>
-                        (lock.externalCameraId && c.id === lock.externalCameraId) ||
-                        (lock.entranceId &&
-                          c.entranceId === lock.entranceId &&
-                          c.placeId === lock.placeId) ||
-                        (!lock.entranceId &&
-                          lock.accessControlId &&
-                          c.accessControlId === lock.accessControlId &&
-                          c.placeId === lock.placeId)
-                    ) || null;
+                  const linkedCam = findLinkedCameraForLock(lock);
                   const displayLockName = linkedCam?.name || lock.name;
                   const isCustomRenamed = Boolean(
                     linkedCam?.originalName &&
                       linkedCam.originalName.trim() !== linkedCam.name.trim()
                   );
+                  const lockAllowed = canOpenLockItem(lock);
 
                   return (
                     <div
@@ -1022,7 +1106,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                       >
                         <div
                           className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
-                            isUnlocked
+                            !lockAllowed
+                              ? 'bg-amber-500/10 text-amber-500'
+                              : isUnlocked
                               ? 'bg-emerald-500/15 text-emerald-500'
                               : isEsp32
                               ? 'bg-[#2563EB]/10 text-[#2563EB] dark:text-[#3B82F6]'
@@ -1040,25 +1126,39 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                             {displayLockName}
                           </div>
                           <div className="text-[11px] text-slate-400 truncate">
-                            {lock.acName || lock.placeAddress}
+                            {!lockAllowed
+                              ? 'Ворота доступны после пополнения баланса'
+                              : lock.acName || lock.placeAddress}
                           </div>
                         </div>
                       </div>
 
-                      <button
-                        type="button"
-                        disabled={isUnlocking}
-                        onClick={() => onOpenLock(lock)}
-                        className={`px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                          isUnlocked
-                            ? 'bg-emerald-500 text-white'
-                            : isUnlocking
-                            ? 'bg-slate-200 dark:bg-white/10 text-slate-400 cursor-wait'
-                            : 'bg-[#2563EB] hover:bg-blue-700 text-white'
-                        }`}
-                      >
-                        {isUnlocking ? 'Открываем...' : isUnlocked ? 'Открыто' : 'Открыть'}
-                      </button>
+                      {lockAllowed ? (
+                        <button
+                          type="button"
+                          disabled={isUnlocking}
+                          onClick={() => onOpenLock(lock)}
+                          className={`px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                            isUnlocked
+                              ? 'bg-emerald-500 text-white'
+                              : isUnlocking
+                              ? 'bg-slate-200 dark:bg-white/10 text-slate-400 cursor-wait'
+                              : 'bg-[#2563EB] hover:bg-blue-700 text-white'
+                          }`}
+                        >
+                          {isUnlocking ? 'Открываем...' : isUnlocked ? 'Открыто' : 'Открыть'}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={onNavigateSettings}
+                          title="Для открытия ворот пополните баланс"
+                          className="px-3 py-2 rounded-xl text-xs font-semibold bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+                        >
+                          <Lock className="w-3.5 h-3.5" />
+                          <span>Оплатить</span>
+                        </button>
+                      )}
                     </div>
                   );
                 })
@@ -1077,11 +1177,17 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             </button>
             <button
               type="button"
-              onClick={isRestricted ? onNavigateSettings : onNavigateAccess}
+              onClick={effectiveRestricted ? onNavigateSettings : onNavigateAccess}
               className="px-3 py-2 rounded-xl bg-white dark:bg-[#12161f] border border-slate-200 dark:border-white/[0.08] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:border-slate-300 dark:hover:border-white/20 inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer"
             >
               <KeyRound className="w-3.5 h-3.5 text-[#2563EB] dark:text-[#3B82F6]" />
-              <span>{isRestricted ? 'Продлить подписку' : 'Гостевой доступ'}</span>
+              <span>
+                {effectiveRestricted
+                  ? isNoFundsLimited
+                    ? 'Пополнить баланс'
+                    : 'О подписке'
+                  : 'Гостевой доступ'}
+              </span>
             </button>
           </div>
         </section>
@@ -1102,7 +1208,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 Открытия дверей, калиток и звонки с домофона
               </p>
             </div>
-            {!isRestricted && (
+            {!isFullBlocked && (
               <button
                 type="button"
                 onClick={onNavigateArchive}
@@ -1114,14 +1220,14 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             )}
           </div>
 
-          {isRestricted ? (
+          {isFullBlocked ? (
             <div className="flex-1 py-8 flex flex-col items-center justify-center text-center gap-2.5 text-xs text-slate-400">
-              <Lock className="w-5 h-5 text-amber-500" />
+              <Lock className="w-5 h-5 text-rose-500" />
               <span className="font-medium text-slate-700 dark:text-slate-200">
                 История событий и просмотр архива заблокированы
               </span>
               <span className="text-[11px] max-w-xs">
-                Оплатите или разблокируйте подписку, чтобы открывать журнал вызовов и записи камер.
+                Ваш аккаунт полностью заблокирован администратором. Доступен только онлайн-просмотр камер.
               </span>
             </div>
           ) : timelineRows.length === 0 ? (
@@ -1287,12 +1393,12 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                   </span>
                   <span className="font-mono tabular-nums font-semibold text-slate-900 dark:text-white">
                     {billingMe.user.status === 'active'
-                      ? `Активна · ${billingMe.user.balanceRub.toFixed(0)} ₽`
+                      ? `Активна · ${formatRub(billingMe.user.balanceRub)} ₽`
                       : billingMe.user.status === 'trial'
-                        ? `Триал · ${billingMe.user.balanceRub.toFixed(0)} ₽`
+                        ? `Триал (подарок) · ${formatRub(billingMe.user.balanceRub)} ₽`
                         : billingMe.user.status === 'blocked'
-                          ? 'Заблокирована'
-                          : `Истекла · ${billingMe.user.balanceRub.toFixed(0)} ₽`}
+                          ? 'Полная блокировка'
+                          : `Нет средств (лимит) · ${formatRub(billingMe.user.balanceRub)} ₽`}
                   </span>
                 </div>
               )}

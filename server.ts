@@ -790,28 +790,153 @@ async function startServer() {
   const placeCameraCatalog = new Map<string, PlaceCameraCatalogRecord>();
   const verifiedTokenPlacesMap = new Map<string, { placeIds: Set<string>; verifiedAt: number }>();
 
+  interface KnownCameraMeta {
+    id: string;
+    originalName: string;
+    placeId: string;
+    source: string;
+    accessControlId: string | null;
+    entranceId: string | null;
+  }
+
+  interface KnownLockMeta {
+    placeId: string;
+    accessControlId: string;
+    entranceId: string | null;
+    name: string;
+    kind?: string;
+    controllerType?: string;
+  }
+
+  const knownCameraMetaMap = new Map<string, KnownCameraMeta>();
+  const knownLockMetaMap = new Map<string, KnownLockMeta>();
+  const eventCameraIdMap = new Map<string, string>();
+
+  function rememberKnownCameraMeta(meta: KnownCameraMeta) {
+    if (!meta.id) return;
+    const prev = knownCameraMetaMap.get(meta.id);
+    knownCameraMetaMap.set(meta.id, {
+      id: meta.id,
+      originalName: meta.originalName || prev?.originalName || '',
+      placeId: meta.placeId || prev?.placeId || '',
+      source: meta.source || prev?.source || 'public',
+      accessControlId: meta.accessControlId ?? prev?.accessControlId ?? null,
+      entranceId: meta.entranceId ?? prev?.entranceId ?? null,
+    });
+  }
+
+  function rememberKnownLockMeta(meta: KnownLockMeta) {
+    if (!meta.placeId || !meta.accessControlId) return;
+    const exactKey = `${meta.placeId}:${meta.accessControlId}:${meta.entranceId || ''}`;
+    knownLockMetaMap.set(exactKey, meta);
+    if (!meta.entranceId) {
+      knownLockMetaMap.set(`${meta.placeId}:${meta.accessControlId}`, meta);
+    }
+  }
+
+  function isGateLockServer(params: {
+    placeId?: string;
+    accessControlId?: string | number | null;
+    entranceId?: string | null;
+    lockName?: string;
+  }): boolean {
+    if (resolveEsp32ChannelFromLockParams(params.accessControlId, params.entranceId) !== null) {
+      return true;
+    }
+    const pid = String(params.placeId || '').trim();
+    const acStr = String(params.accessControlId || '').trim();
+    const entStr = params.entranceId != null ? String(params.entranceId).trim() : '';
+    const meta =
+      knownLockMetaMap.get(`${pid}:${acStr}:${entStr}`) ||
+      knownLockMetaMap.get(`${pid}:${acStr}`);
+
+    if (meta?.controllerType === 'esp32' || meta?.kind === 'barrier') {
+      return true;
+    }
+    const rawName = String(meta?.name || params.lockName || '').toLowerCase();
+    if (meta?.kind === 'gate' && !rawName.includes('калитк')) {
+      return true;
+    }
+    if (!rawName) return false;
+    return rawName.includes('ворот') || rawName.includes('шлагбаум') || rawName.includes('фасад');
+  }
+
+  function isEntranceOrWicketCameraServer(
+    cameraId: string,
+    placeId?: string,
+    cameraNameHint?: string
+  ): boolean {
+    const cid = String(cameraId || '').trim();
+    let meta = cid ? knownCameraMetaMap.get(cid) : undefined;
+    if (!meta && cid && placeId && placeId !== 'null') {
+      const cat = placeCameraCatalog.get(String(placeId));
+      const found = cat?.cameras.find((c) => c.id === cid);
+      if (found) {
+        meta = {
+          id: found.id,
+          originalName: found.name,
+          placeId: found.placeId,
+          source: found.source,
+          accessControlId: null,
+          entranceId: null,
+        };
+      }
+    }
+    const rawName = String(meta?.originalName || cameraNameHint || '').toLowerCase();
+    // Gate / facade cameras are NOT entrance/wicket cameras (archive allowed in Mode 2)
+    if (rawName.includes('фасад') || rawName.includes('ворот') || rawName.includes('шлагбаум')) {
+      return false;
+    }
+    if (meta?.source === 'intercom') {
+      return true;
+    }
+    if (
+      rawName.includes('калитк') ||
+      rawName.includes('подъезд') ||
+      rawName.includes('домофон') ||
+      rawName.includes('входная') ||
+      /\(\s*п\.?\s*\d+\s*\)/i.test(rawName) ||
+      /\bп\.\s*\d+\b/i.test(rawName)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
   function loadPlaceCameraCatalogFromDisk() {
     try {
       const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(PLACE_CAMERAS_FILE);
       if (parsed && typeof parsed.places === 'object' && parsed.places !== null) {
         for (const [pid, rec] of Object.entries(parsed.places as Record<string, any>)) {
           if (pid && rec && Array.isArray(rec.cameras)) {
+            const cams = rec.cameras.map((c: any) => ({
+              id: String(c.id || ''),
+              name: String(c.name || `Камера ${c.id || ''}`),
+              placeId: String(c.placeId || pid),
+              placeAddress: String(c.placeAddress || ''),
+              source: String(c.source || 'public'),
+              timeZone: Number(c.timeZone) || 25200,
+              retentionDays: Math.max(1, Math.min(7, Number(c.retentionDays) || 7)),
+              allowOpen: false,
+              videoDownloadAvailable: Boolean(c.videoDownloadAvailable ?? true),
+            })).filter((c: CachedPlaceCameraEntry) => Boolean(c.id));
+
             placeCameraCatalog.set(String(pid), {
               placeId: String(pid),
               ownerUserId: String(rec.ownerUserId || ''),
               updatedAt: Number(rec.updatedAt) || Date.now(),
-              cameras: rec.cameras.map((c: any) => ({
-                id: String(c.id || ''),
-                name: String(c.name || `Камера ${c.id || ''}`),
-                placeId: String(c.placeId || pid),
-                placeAddress: String(c.placeAddress || ''),
-                source: String(c.source || 'public'),
-                timeZone: Number(c.timeZone) || 25200,
-                retentionDays: Math.max(1, Math.min(7, Number(c.retentionDays) || 7)),
-                allowOpen: false,
-                videoDownloadAvailable: Boolean(c.videoDownloadAvailable ?? true),
-              })).filter((c: CachedPlaceCameraEntry) => Boolean(c.id)),
+              cameras: cams,
             });
+            for (const c of cams) {
+              rememberKnownCameraMeta({
+                id: c.id,
+                originalName: c.name,
+                placeId: c.placeId,
+                source: c.source,
+                accessControlId: null,
+                entranceId: null,
+              });
+            }
           }
         }
         if (wasPlaintext) {
@@ -856,6 +981,16 @@ async function startServer() {
         videoDownloadAvailable: Boolean(c.videoDownloadAvailable ?? true),
       }));
     if (normalized.length === 0) return;
+    for (const c of normalized) {
+      rememberKnownCameraMeta({
+        id: c.id,
+        originalName: c.name,
+        placeId: c.placeId,
+        source: c.source,
+        accessControlId: null,
+        entranceId: null,
+      });
+    }
     placeCameraCatalog.set(pid, {
       placeId: pid,
       ownerUserId: String(ownerUserId),
@@ -1999,6 +2134,14 @@ async function startServer() {
           lock.entranceId,
           lock.externalCameraId
         );
+        rememberKnownLockMeta({
+          placeId: String(lock.placeId),
+          accessControlId: String(lock.accessControlId),
+          entranceId: lock.entranceId != null ? String(lock.entranceId) : null,
+          name: String(lock.name || ''),
+          kind: lock.kind,
+          controllerType: lock.controllerType,
+        });
       }
 
       const syncedPlaceIds = new Set(places.map((p) => String(p.id)));
@@ -2033,6 +2176,14 @@ async function startServer() {
       for (const cam of dedupedCameras) {
         const rawName = String(cam.name || '');
         cam.originalName = rawName;
+        rememberKnownCameraMeta({
+          id: String(cam.id),
+          originalName: rawName,
+          placeId: String(cam.placeId || ''),
+          source: String(cam.source || 'public'),
+          accessControlId: cam.accessControlId ?? null,
+          entranceId: cam.entranceId ?? null,
+        });
         const alias = userCameraAliases[cam.id];
         if (alias && alias.trim()) {
           cam.name = alias.trim();
@@ -2060,12 +2211,39 @@ async function startServer() {
   // 7. Open Door / Gate / Barrier (`api.py:open_lock` + ESP32 Remote Relay for Gates)
   app.post('/api/eg/locks/open', async (req: Request, res: Response) => {
     try {
-      if (!(await assertActiveSubscription(req, res))) return;
+      const accessState = await resolveBillingAccessState(req, res);
+      if (!accessState.allowed) return;
       const ctx = extractContext(req);
       const { placeId, accessControlId, entranceId } = req.body || {};
       if (!placeId || !accessControlId) {
         res.status(400).json({ error: 'missing_params', message: 'Не указан placeId или accessControlId' });
         return;
+      }
+
+      const gateLock = isGateLockServer({
+        placeId: String(placeId),
+        accessControlId,
+        entranceId: entranceId != null ? String(entranceId) : null,
+      });
+
+      if (accessState.user) {
+        if (accessState.user.status === 'blocked') {
+          res.status(402).json({
+            error: 'subscription_required',
+            status: 'blocked',
+            message: 'Ваш аккаунт заблокирован. Доступен только онлайн-просмотр камер.',
+          });
+          return;
+        }
+        if (accessState.user.status === 'expired' && gateLock) {
+          res.status(402).json({
+            error: 'subscription_required',
+            status: 'expired',
+            message:
+              'Недостаточно средств на балансе: открытие ворот недоступно (можно открывать только калитки и подъезды). Пополните баланс в «Настройках».',
+          });
+          return;
+        }
       }
 
       // Check if this lock is an ESP32-controlled gate ("Камера фасад 1" / "Камера фасад 2")
@@ -2230,7 +2408,32 @@ async function startServer() {
       const placeId = req.query.placeId ? String(req.query.placeId) : 'null';
       const speedParam = req.query.speed ? String(req.query.speed) : '-1.0';
 
-      if (ts && !(await assertActiveSubscription(req, res))) return;
+      if (ts) {
+        const accessState = await resolveBillingAccessState(req, res);
+        if (!accessState.allowed) return;
+        if (accessState.user) {
+          if (accessState.user.status === 'blocked') {
+            res.status(402).json({
+              error: 'subscription_required',
+              status: 'blocked',
+              message: 'Ваш аккаунт заблокирован. Архив видеозаписей недоступен.',
+            });
+            return;
+          }
+          if (
+            accessState.user.status === 'expired' &&
+            isEntranceOrWicketCameraServer(cameraId, placeId)
+          ) {
+            res.status(402).json({
+              error: 'subscription_required',
+              status: 'expired',
+              message:
+                'Недостаточно средств: архив подъездных камер и калиток недоступен. Доступен архив только обзорных и дворовых камер.',
+            });
+            return;
+          }
+        }
+      }
 
       const ctx = extractContext(req);
 
@@ -2580,7 +2783,8 @@ async function startServer() {
   // 11. Camera Archive Motion Events (`api.py:query_camera_events`)
   app.get('/api/eg/cameras/:cameraId/events', async (req: Request, res: Response) => {
     try {
-      if (!(await assertActiveSubscription(req, res))) return;
+      const accessState = await resolveBillingAccessState(req, res);
+      if (!accessState.allowed) return;
       const cameraId = String(req.params.cameraId || '');
       const lowerDate = String(req.query.lowerDate || '');
       const upperDate = String(req.query.upperDate || '');
@@ -2589,6 +2793,29 @@ async function startServer() {
         10,
         Math.min(100, parseInt(String(req.query.count || '100'), 10) || 100)
       );
+
+      if (accessState.user) {
+        if (accessState.user.status === 'blocked') {
+          res.status(402).json({
+            error: 'subscription_required',
+            status: 'blocked',
+            message: 'Ваш аккаунт заблокирован. Журнал и архив недоступны.',
+          });
+          return;
+        }
+        if (
+          accessState.user.status === 'expired' &&
+          isEntranceOrWicketCameraServer(cameraId, placeId)
+        ) {
+          res.status(402).json({
+            error: 'subscription_required',
+            status: 'expired',
+            message:
+              'Недостаточно средств: архив подъездных камер и калиток недоступен.',
+          });
+          return;
+        }
+      }
 
       if (!lowerDate || !upperDate) {
         res.status(400).json({ error: 'missing_dates', message: 'Укажите lowerDate и upperDate' });
@@ -2626,17 +2853,23 @@ async function startServer() {
         }
       }
       const events = rawList
-        .map((item) => ({
-          id: String(item.ID),
-          cameraId,
-          backendCameraId: String(item.CameraID || cameraId),
-          timestamp: Number(item.Time),
-          duration: Number(item.Duration || 0),
-          eventSubjectId: Number(item.EventSubjectID || 126),
-          available: Boolean(item.isAvailable ?? true),
-          gotoEnabled: Number(item.IsGotoEnabled ?? 1) === 1,
-          message: item.Message || null,
-        }))
+        .map((item) => {
+          const eid = String(item.ID);
+          if (eid && cameraId) {
+            eventCameraIdMap.set(eid, cameraId);
+          }
+          return {
+            id: eid,
+            cameraId,
+            backendCameraId: String(item.CameraID || cameraId),
+            timestamp: Number(item.Time),
+            duration: Number(item.Duration || 0),
+            eventSubjectId: Number(item.EventSubjectID || 126),
+            available: Boolean(item.isAvailable ?? true),
+            gotoEnabled: Number(item.IsGotoEnabled ?? 1) === 1,
+            message: item.Message || null,
+          };
+        })
         .sort((a, b) => b.timestamp - a.timestamp);
 
       const hasMore = rawList.length >= requestedCount;
@@ -2745,12 +2978,37 @@ async function startServer() {
   // 12. MP4 Archive Event Clip Proxy with HTTP 206 Byte-Range Support & Stream Remux Fallback (`clip_proxy.py`)
   app.get('/api/eg/events/:eventId/clip', async (req: Request, res: Response) => {
     try {
-      if (!(await assertActiveSubscription(req, res))) return;
+      const accessState = await resolveBillingAccessState(req, res);
+      if (!accessState.allowed) return;
       cleanupClipCache();
       const eventId = String(req.params.eventId || '');
       const downloadMode = req.query.download === '1';
       const cameraId = typeof req.query.cameraId === 'string' ? req.query.cameraId : '';
       const placeId = typeof req.query.placeId === 'string' ? req.query.placeId : 'null';
+
+      if (accessState.user) {
+        if (accessState.user.status === 'blocked') {
+          res.status(402).json({
+            error: 'subscription_required',
+            status: 'blocked',
+            message: 'Ваш аккаунт заблокирован. Архив и скачивание MP4 недоступны.',
+          });
+          return;
+        }
+        if (accessState.user.status === 'expired') {
+          const authCamId = eventCameraIdMap.get(eventId) || cameraId;
+          if (!authCamId || isEntranceOrWicketCameraServer(authCamId, placeId)) {
+            res.status(402).json({
+              error: 'subscription_required',
+              status: 'expired',
+              message:
+                'Недостаточно средств: архив и скачивание MP4 для подъездных камер и калиток недоступны.',
+            });
+            return;
+          }
+        }
+      }
+
       const tsQuery = req.query.ts ? Number(req.query.ts) : 0;
       const durationQuery = req.query.duration ? Number(req.query.duration) : 30;
       const tzQuery = typeof req.query.tz === 'string' && req.query.tz ? req.query.tz : '25200';
@@ -3102,7 +3360,17 @@ async function startServer() {
   // 13. Place Events History (`api.py:query_events`)
   app.post('/api/eg/events/history', async (req: Request, res: Response) => {
     try {
-      if (!(await assertActiveSubscription(req, res))) return;
+      const accessState = await resolveBillingAccessState(req, res);
+      if (!accessState.allowed) return;
+      if (accessState.user && accessState.user.status === 'blocked') {
+        res.status(402).json({
+          error: 'subscription_required',
+          status: 'blocked',
+          message: 'Ваш аккаунт заблокирован. Журнал событий отключён.',
+        });
+        return;
+      }
+
       const ctx = extractContext(req);
       const placeIds = Array.isArray(req.body?.placeIds)
         ? req.body.placeIds.map((id: any) => Number(id)).filter((n: number) => !isNaN(n))
@@ -3124,7 +3392,7 @@ async function startServer() {
       );
 
       const content: any[] = Array.isArray(evRes.data?.content) ? evRes.data.content : [];
-      const events = content.map((item) => {
+      let events = content.map((item) => {
         const srcType = String(item.source?.type || '');
         const srcId = String(item.source?.id || '');
         const cameraId =
@@ -3154,6 +3422,25 @@ async function startServer() {
           entranceId: entranceId != null ? String(entranceId) : null,
         };
       });
+
+      if (accessState.user && accessState.user.status === 'expired') {
+        events = events.filter((ev) => {
+          if (ev.cameraId && isEntranceOrWicketCameraServer(ev.cameraId, ev.placeId, ev.message)) {
+            return false;
+          }
+          const msgLower = String(ev.message || '').toLowerCase();
+          if (
+            msgLower.includes('калитк') ||
+            msgLower.includes('подъезд') ||
+            msgLower.includes('домофон') ||
+            msgLower.includes('звонок') ||
+            msgLower.includes('вызов')
+          ) {
+            return false;
+          }
+          return true;
+        });
+      }
 
       res.json({
         events,
@@ -4115,6 +4402,8 @@ async function startServer() {
     autoRenew: boolean;
     trialEndsAt: number;
     paidUntil: number | null;
+    previousStatus?: 'trial' | 'active' | 'expired';
+    lastBilledAt?: number;
     createdAt: number;
     lastSeenAt: number;
     notes: string;
@@ -4685,35 +4974,89 @@ async function startServer() {
     if (user.status === 'blocked') return false;
     const now = Date.now();
     const price = Math.max(1, Number(billingStore.config.monthlyPriceRub) || 50);
+    const dailyRate = price / 30;
     let changed = false;
 
-    if (user.status === 'trial' && user.trialEndsAt <= now) {
-      if (user.autoRenew && user.balanceRub >= price) {
-        user.balanceRub = Number((user.balanceRub - price).toFixed(2));
+    if (user.role === 'admin') {
+      if (user.status !== 'active') {
         user.status = 'active';
-        user.paidUntil = now + 30 * DAY_MS;
-        billingStore.transactions.unshift({
-          id: `tx_${crypto.randomBytes(6).toString('hex')}`,
-          userId: user.userId,
-          userName: user.name,
-          userPhone: user.phone,
-          type: 'subscription_charge',
-          status: 'completed',
-          amountRub: -price,
-          description: `Автопродление подписки после пробного периода (30 дн.)`,
-          paymentChannel: 'auto_renew',
-          npdReceiptStatus: 'not_required',
-          npdReceiptNumber: null,
-          createdAt: now,
-        });
-      } else {
-        user.status = 'expired';
+        changed = true;
       }
-      changed = true;
+      if (!user.paidUntil || user.paidUntil < now + 7 * DAY_MS) {
+        user.paidUntil = now + 30 * DAY_MS;
+        changed = true;
+      }
+      return changed;
+    }
+
+    if (user.status === 'trial') {
+      const lastBilled = user.lastBilledAt || user.createdAt || now;
+      if (!user.lastBilledAt) {
+        user.lastBilledAt = lastBilled;
+        changed = true;
+      }
+      const elapsedDays = Math.floor((now - lastBilled) / DAY_MS);
+
+      if (user.trialEndsAt > now) {
+        if (elapsedDays >= 1) {
+          const charge = Math.min(user.balanceRub, Number(((elapsedDays * price) / 30).toFixed(2)));
+          if (charge > 0) {
+            user.balanceRub = Math.max(0, Number((user.balanceRub - charge).toFixed(2)));
+          }
+          user.lastBilledAt = lastBilled + elapsedDays * DAY_MS;
+          changed = true;
+        }
+        if (user.balanceRub <= 0.05) {
+          user.balanceRub = 0;
+          if (user.autoRenew && user.balanceRub >= price) {
+            user.balanceRub = Number((user.balanceRub - price).toFixed(2));
+            user.status = 'active';
+            user.paidUntil = now + 30 * DAY_MS;
+          } else {
+            user.status = 'expired';
+          }
+          changed = true;
+        }
+      } else {
+        if (user.autoRenew && user.balanceRub >= price) {
+          user.balanceRub = Number((user.balanceRub - price).toFixed(2));
+          user.status = 'active';
+          user.paidUntil = now + 30 * DAY_MS;
+          user.lastBilledAt = now;
+          billingStore.transactions.unshift({
+            id: `tx_${crypto.randomBytes(6).toString('hex')}`,
+            userId: user.userId,
+            userName: user.name,
+            userPhone: user.phone,
+            type: 'subscription_charge',
+            status: 'completed',
+            amountRub: -price,
+            description: `Автопродление подписки после пробного периода (30 дн.)`,
+            paymentChannel: 'auto_renew',
+            npdReceiptStatus: 'not_required',
+            npdReceiptNumber: null,
+            createdAt: now,
+          });
+        } else {
+          if (elapsedDays >= 1) {
+            const charge = Math.min(user.balanceRub, Number(((elapsedDays * price) / 30).toFixed(2)));
+            if (charge > 0) {
+              user.balanceRub = Math.max(0, Number((user.balanceRub - charge).toFixed(2)));
+            }
+            user.lastBilledAt = now;
+          }
+          if (user.balanceRub > 0 && user.balanceRub <= Number((dailyRate + 0.15).toFixed(2))) {
+            user.balanceRub = 0;
+          }
+          user.status = 'expired';
+        }
+        changed = true;
+      }
     } else if (user.status === 'active' && user.paidUntil != null && user.paidUntil <= now) {
       if (user.autoRenew && user.balanceRub >= price) {
         user.balanceRub = Number((user.balanceRub - price).toFixed(2));
         user.paidUntil = now + 30 * DAY_MS;
+        user.lastBilledAt = now;
         billingStore.transactions.unshift({
           id: `tx_${crypto.randomBytes(6).toString('hex')}`,
           userId: user.userId,
@@ -4736,6 +5079,7 @@ async function startServer() {
       user.balanceRub = Number((user.balanceRub - price).toFixed(2));
       user.status = 'active';
       user.paidUntil = now + 30 * DAY_MS;
+      user.lastBilledAt = now;
       billingStore.transactions.unshift({
         id: `tx_${crypto.randomBytes(6).toString('hex')}`,
         userId: user.userId,
@@ -4825,15 +5169,18 @@ async function startServer() {
     }
 
     if (!user) {
+      const price = Math.max(1, Number(billingStore.config.monthlyPriceRub) || 50);
       const trialDays = Math.max(0, Number(billingStore.config.trialDays) || 7);
       let resolvedTrialEndsAt = now + trialDays * DAY_MS;
 
       // Prevent free-trial farming via Incognito / second browser on the exact same Dom.ru login:
       // separate devices still get separate paid accounts, but inherit the earliest trial end date of that login.
+      let siblingCount = 0;
       if (!ownerMatch) {
         const siblingUsers = billingStore.users.filter(
           (u) => !isOwnerIdentity(u.phone, u.subscriberId, u.phoneHash) && samePersonalSubscriber(u)
         );
+        siblingCount = siblingUsers.length;
         if (siblingUsers.length > 0) {
           const earliestTrial = Math.min(
             ...siblingUsers.map((s) => (Number.isFinite(s.trialEndsAt) ? s.trialEndsAt : now))
@@ -4841,6 +5188,14 @@ async function startServer() {
           resolvedTrialEndsAt = Math.min(resolvedTrialEndsAt, earliestTrial);
         }
       }
+
+      const remainingTrialDays = Math.max(0, (resolvedTrialEndsAt - now) / DAY_MS);
+      const giftRub =
+        !ownerMatch && trialDays > 0 && remainingTrialDays > 0.05
+          ? siblingCount === 0
+            ? Number(((price / 30) * trialDays).toFixed(2))
+            : Number(((price / 30) * remainingTrialDays).toFixed(2))
+          : 0;
 
       const subKey = cleanPhoneHash || cleanSubscriberId || cleanNameLower || 'anon';
       const deterministicSeed = cleanDeviceId ? `${subKey}|${cleanDeviceId}` : subKey;
@@ -4862,16 +5217,37 @@ async function startServer() {
         name: cleanName || 'Пользователь Open-Key',
         address: cleanAddress,
         role: ownerMatch ? 'admin' : 'user',
-        balanceRub: 0,
-        status: trialDays > 0 && resolvedTrialEndsAt > now ? 'trial' : 'expired',
+        balanceRub: ownerMatch ? 0 : giftRub,
+        status: ownerMatch
+          ? 'active'
+          : trialDays > 0 && resolvedTrialEndsAt > now && giftRub > 0
+            ? 'trial'
+            : 'expired',
         autoRenew: true,
         trialEndsAt: resolvedTrialEndsAt,
-        paidUntil: null,
+        paidUntil: ownerMatch ? now + 30 * DAY_MS : null,
+        lastBilledAt: now,
         createdAt: now,
         lastSeenAt: now,
         notes: '',
       };
       billingStore.users.unshift(user);
+      if (!ownerMatch && giftRub > 0) {
+        billingStore.transactions.unshift({
+          id: `tx_${crypto.randomBytes(6).toString('hex')}`,
+          userId: user.userId,
+          userName: user.name,
+          userPhone: '',
+          type: 'manual_adjust',
+          status: 'completed',
+          amountRub: giftRub,
+          description: `Приветственный подарок новому пользователю (${trialDays} дн. · тариф ${price} ₽/мес)`,
+          paymentChannel: 'system',
+          npdReceiptStatus: 'not_required',
+          npdReceiptNumber: null,
+          createdAt: now,
+        });
+      }
     } else {
       user.phone = '';
       if (cleanPhoneHash && !user.phoneHash) user.phoneHash = cleanPhoneHash;
@@ -4896,21 +5272,24 @@ async function startServer() {
     return user;
   }
 
-  async function assertActiveSubscription(req: Request, res: Response): Promise<boolean> {
+  async function resolveBillingAccessState(
+    req: Request,
+    res: Response
+  ): Promise<{ allowed: boolean; isDemo: boolean; user: ServerBillingUser | null }> {
     const verified = await resolveVerifiedSession(req);
     if (verified.isDemo) {
-      return true;
+      return { allowed: true, isDemo: true, user: null };
     }
     if (!verified.authenticated) {
       const ctx = extractContext(req);
       if (!ctx.accessToken) {
-        return true;
+        return { allowed: true, isDemo: true, user: null };
       }
       res.status(401).json({
         error: 'unauthorized',
         message: 'Сессия недействительна или истекла. Выполните повторный вход.',
       });
-      return false;
+      return { allowed: false, isDemo: false, user: null };
     }
     const ctx = extractContext(req);
     const user = upsertBillingUserFromIdentity({
@@ -4922,14 +5301,22 @@ async function startServer() {
       name: verified.name,
     });
     rememberUserDomruSession(user.userId, ctx);
+    return { allowed: true, isDemo: false, user };
+  }
+
+  async function assertActiveSubscription(req: Request, res: Response): Promise<boolean> {
+    const state = await resolveBillingAccessState(req, res);
+    if (!state.allowed) return false;
+    if (!state.user) return true;
+    const user = state.user;
     if (user.status === 'expired' || user.status === 'blocked') {
       res.status(402).json({
         error: 'subscription_required',
         status: user.status,
         message:
           user.status === 'blocked'
-            ? 'Ваш аккаунт заблокирован. Доступен только онлайн-просмотр камер.'
-            : 'Подписка не оплачена или истекла. Доступен только онлайн-просмотр камер — продлите подписку в «Настройках».',
+            ? 'Ваш аккаунт полностью заблокирован администратором. Доступен только онлайн-просмотр камер.'
+            : 'Недостаточно средств на балансе: эта функция недоступна (разрешены онлайн-просмотр, калитки/подъезд и архив обзорных камер).',
       });
       return false;
     }
@@ -5546,7 +5933,21 @@ async function startServer() {
       }
 
       const now = Date.now();
-      const initBalance = Number.isFinite(Number(balanceRub)) ? Math.round(Number(balanceRub) * 100) / 100 : 0;
+      const price = Math.max(1, Number(billingStore.config.monthlyPriceRub) || 50);
+      const trialDays = Math.max(0, Number(billingStore.config.trialDays) || 7);
+      const targetStatus: BillingStatus =
+        status === 'active' || status === 'expired' || status === 'blocked' ? status : 'trial';
+      const rawInitBalance = Number.isFinite(Number(balanceRub))
+        ? Math.round(Number(balanceRub) * 100) / 100
+        : 0;
+      const defaultTrialGift =
+        targetStatus === 'trial' && trialDays > 0
+          ? Number(((price / 30) * trialDays).toFixed(2))
+          : 0;
+      const initBalance =
+        targetStatus === 'trial' && rawInitBalance === 0 ? defaultTrialGift : rawInitBalance;
+      const grantedWelcomeGift =
+        targetStatus === 'trial' && rawInitBalance === 0 && initBalance > 0;
       const userId = cleanPhoneHash
         ? `usr_${cleanPhoneHash.slice(0, 12)}`
         : `usr_${crypto.randomBytes(5).toString('hex')}`;
@@ -5559,10 +5960,11 @@ async function startServer() {
         address: String(address || '').trim(),
         role: isOwnerIdentity(cleanPhone, '', cleanPhoneHash) || role === 'admin' ? 'admin' : 'user',
         balanceRub: initBalance,
-        status: status === 'active' || status === 'expired' || status === 'blocked' ? status : 'trial',
+        status: targetStatus,
         autoRenew: true,
-        trialEndsAt: now + Math.max(0, Number(billingStore.config.trialDays) || 7) * DAY_MS,
-        paidUntil: status === 'active' ? now + 30 * DAY_MS : null,
+        trialEndsAt: now + trialDays * DAY_MS,
+        paidUntil: targetStatus === 'active' ? now + 30 * DAY_MS : null,
+        lastBilledAt: now,
         createdAt: now,
         lastSeenAt: now,
         notes: String(notes || '').trim(),
@@ -5574,12 +5976,14 @@ async function startServer() {
           userId: newUser.userId,
           userName: newUser.name,
           userPhone: '',
-          type: 'topup',
+          type: grantedWelcomeGift ? 'manual_adjust' : 'topup',
           status: 'completed',
           amountRub: initBalance,
-          description: 'Начальное пополнение баланса администратором',
-          paymentChannel: 'manual',
-          npdReceiptStatus: 'pending',
+          description: grantedWelcomeGift
+            ? `Приветственный подарок на ${trialDays} дн. (тариф ${price} ₽/мес)`
+            : 'Начальное пополнение баланса администратором',
+          paymentChannel: grantedWelcomeGift ? 'system' : 'manual',
+          npdReceiptStatus: grantedWelcomeGift ? 'not_required' : 'pending',
           npdReceiptNumber: null,
           createdAt: now,
         });
@@ -5659,19 +6063,53 @@ async function startServer() {
         return;
       }
 
-      const { status, addDays, role, autoRenew, notes } = req.body || {};
+      const { status, action, addDays, role, autoRenew, notes } = req.body || {};
       const now = Date.now();
-      if (status === 'trial' || status === 'active' || status === 'expired' || status === 'blocked') {
-        user.status = status;
-        if (status === 'active' && (!user.paidUntil || user.paidUntil < now)) {
+      const price = Math.max(1, Number(billingStore.config.monthlyPriceRub) || 50);
+
+      if (action === 'unblock' || status === 'unblock') {
+        user.previousStatus = undefined;
+        user.lastBilledAt = now;
+        if (user.paidUntil && user.paidUntil > now) {
+          user.status = 'active';
+        } else if (user.trialEndsAt > now && user.balanceRub > 0) {
+          user.status = 'trial';
+        } else {
+          user.status = 'expired';
+        }
+        reconcileUserSubscription(user);
+      } else if (status === 'blocked') {
+        if (user.status !== 'blocked') {
+          user.previousStatus = user.status;
+        }
+        user.status = 'blocked';
+      } else if (status === 'expired') {
+        user.previousStatus = undefined;
+        user.paidUntil = null;
+        user.status = 'expired';
+      } else if (status === 'trial') {
+        user.previousStatus = undefined;
+        user.paidUntil = null;
+        const trialDays = Math.max(1, Number(billingStore.config.trialDays) || 7);
+        if (!user.trialEndsAt || user.trialEndsAt <= now) {
+          user.trialEndsAt = now + trialDays * DAY_MS;
+        }
+        user.lastBilledAt = now;
+        user.status = 'trial';
+      } else if (status === 'active') {
+        user.previousStatus = undefined;
+        user.status = 'active';
+        if (!user.paidUntil || user.paidUntil < now) {
           user.paidUntil = now + 30 * DAY_MS;
         }
       }
+
       if (typeof addDays === 'number' && Number.isFinite(addDays) && addDays !== 0) {
         const base = user.paidUntil && user.paidUntil > now ? user.paidUntil : now;
         user.paidUntil = base + addDays * DAY_MS;
         if (addDays > 0 && user.status !== 'blocked') {
           user.status = 'active';
+          user.previousStatus = undefined;
         }
       }
       if (role === 'admin' || role === 'user') {
@@ -5679,6 +6117,9 @@ async function startServer() {
       }
       if (typeof autoRenew === 'boolean') {
         user.autoRenew = autoRenew;
+        if (autoRenew && user.status !== 'blocked' && user.balanceRub >= price) {
+          reconcileUserSubscription(user);
+        }
       }
       if (typeof notes === 'string') {
         user.notes = notes.trim().slice(0, 200);

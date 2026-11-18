@@ -29,6 +29,9 @@ interface CameraSnapshotCardProps {
   onRenameCamera?: (camera: CameraItem, newName: string) => Promise<void> | void;
   onNotice?: (msg: string) => void;
   isRestricted?: boolean;
+  canViewArchive?: boolean;
+  canOpenLinkedLock?: boolean;
+  canRename?: boolean;
 }
 
 export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
@@ -43,7 +46,15 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
   onRenameCamera,
   onNotice,
   isRestricted = false,
+  canViewArchive,
+  canOpenLinkedLock,
+  canRename,
 }) => {
+  const effectiveCanViewArchive =
+    canViewArchive !== undefined ? canViewArchive : !isRestricted;
+  const effectiveCanOpenLock =
+    canOpenLinkedLock !== undefined ? canOpenLinkedLock : !isRestricted;
+  const effectiveCanRename = canRename !== undefined ? canRename : !isRestricted;
   const [localNonce, setLocalNonce] = useState<number>(0);
   const [manualRefreshNonce, setManualRefreshNonce] = useState<number>(0);
   const [resolvedUrl, setResolvedUrl] = useState<string | null>(null);
@@ -196,7 +207,7 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
               <Play className="w-3.5 h-3.5 fill-current" />
               <span>Прямой эфир</span>
             </button>
-            {!isRestricted && (
+            {effectiveCanViewArchive && (
               <button
                 type="button"
                 onClick={() => onSelectForVideo(camera, 'archive')}
@@ -232,7 +243,7 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
       {/* Card Body */}
       <div className="p-4 flex flex-col justify-between flex-1 gap-3.5">
         <div>
-          {isEditingName ? (
+          {isEditingName && effectiveCanRename ? (
             <form onSubmit={handleSaveRename} className="space-y-1.5">
               <div className="flex items-center gap-1.5">
                 <input
@@ -305,7 +316,7 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
                 )}
               </div>
               <div className="flex items-center gap-0.5 shrink-0">
-                {onRenameCamera && (
+                {onRenameCamera && effectiveCanRename && (
                   <button
                     type="button"
                     onClick={startEditName}
@@ -366,7 +377,7 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
               <Play className="w-3.5 h-3.5 text-[#2563EB] dark:text-[#3B82F6] fill-current" />
               <span>Видео</span>
             </button>
-            {!isRestricted && (
+            {effectiveCanViewArchive && (
               <button
                 type="button"
                 onClick={() => onSelectForVideo(camera, 'archive')}
@@ -386,7 +397,7 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
             </button>
           </div>
 
-          {!isRestricted && linkedLock && linkedLock.openable && (
+          {effectiveCanOpenLock && linkedLock && linkedLock.openable && (
             <button
               type="button"
               disabled={unlocking}

@@ -330,6 +330,8 @@ export interface BillingUserRecord {
   autoRenew: boolean;
   trialEndsAt: number;
   paidUntil: number | null;
+  previousStatus?: 'trial' | 'active' | 'expired';
+  lastBilledAt?: number;
   createdAt: number;
   lastSeenAt: number;
   notes: string;

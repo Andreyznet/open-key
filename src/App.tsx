@@ -130,6 +130,34 @@ function formatDuration(seconds: number): string {
   return `${secs} сек`;
 }
 
+function formatRub(amount: number): string {
+  const n = Number(amount || 0);
+  if (!Number.isFinite(n)) return '0';
+  return Math.abs(n - Math.round(n)) < 0.005 ? String(Math.round(n)) : n.toFixed(2);
+}
+
+function isGateLock(lock: LockItem, linkedCam?: CameraItem | null): boolean {
+  if (
+    lock.controllerType === 'esp32' ||
+    lock.entranceId?.startsWith('esp32_gate_') ||
+    lock.accessControlId === '990001' ||
+    lock.accessControlId === '990002' ||
+    lock.kind === 'barrier'
+  ) {
+    return true;
+  }
+  const origName = String(linkedCam?.originalName || lock.name || '').toLowerCase();
+  if (lock.kind === 'gate' && !origName.includes('калитк')) return true;
+  return /ворот|шлагбаум|фасад/.test(origName);
+}
+
+function isEntranceOrWicketCamera(cam: CameraItem): boolean {
+  const orig = String(cam.originalName || cam.name || '').toLowerCase();
+  if (/фасад|ворот|шлагбаум/.test(orig)) return false;
+  if (cam.source === 'intercom') return true;
+  return /калитк|подъезд|домофон|входная|\(\s*п\.?\s*\d+\s*\)|\bп\.\s*\d+\b/.test(orig);
+}
+
 function getRecentDays(retentionDays: number): string[] {
   const days: string[] = [];
   const now = new Date();
@@ -277,17 +305,15 @@ export default function App() {
   const [topupAmountInput, setTopupAmountInput] = useState<string>('50');
   const [topupCommentInput, setTopupCommentInput] = useState<string>('');
 
-  const isSubscriptionRestricted = Boolean(
-    billingMe && (billingMe.user.status === 'expired' || billingMe.user.status === 'blocked')
-  );
-
-  useEffect(() => {
-    if (isSubscriptionRestricted && videoPlaybackMode !== 'live') {
-      setVideoPlaybackMode('live');
-      setArchiveTimestampSec(null);
-      setActiveEventId(null);
-    }
-  }, [isSubscriptionRestricted, videoPlaybackMode]);
+  const billingStatus = billingMe?.user.status;
+  const isFullBlocked = billingStatus === 'blocked';
+  const isNoFundsLimited = billingStatus === 'expired';
+  const isSubscriptionRestricted = isFullBlocked || isNoFundsLimited;
+  const restrictionMode: 'none' | 'no_funds' | 'full_blocked' = isFullBlocked
+    ? 'full_blocked'
+    : isNoFundsLimited
+      ? 'no_funds'
+      : 'none';
 
   // ESP32 Gate Remote Controller state
   const [esp32Status, setEsp32Status] = useState<Esp32GateStatusPayload | null>(null);
@@ -753,6 +779,14 @@ export default function App() {
   const handleRenameCamera = useCallback(
     async (camera: CameraItem, rawNewName: string) => {
       if (!session) return;
+      if (isSubscriptionRestricted) {
+        showNotice(
+          isFullBlocked
+            ? 'Аккаунт заблокирован — переименование камер недоступно'
+            : 'При нулевом балансе переименование камер недоступно'
+        );
+        return;
+      }
       try {
         const res = await apiRenameCamera(session, camera.id, rawNewName);
         const fallbackOriginal = camera.originalName || camera.name;
@@ -790,7 +824,7 @@ export default function App() {
         throw err;
       }
     },
-    [session, showNotice]
+    [session, showNotice, isSubscriptionRestricted, isFullBlocked]
   );
 
   const hiddenCamerasCount = useMemo(() => {
@@ -871,10 +905,47 @@ export default function App() {
     [locks]
   );
 
+  const canOpenLock = useCallback(
+    (lock: LockItem | null): boolean => {
+      if (!lock || !lock.openable) return false;
+      if (isFullBlocked) return false;
+      if (isNoFundsLimited) {
+        const linkedCam = getLinkedCameraForLock(lock);
+        return !isGateLock(lock, linkedCam);
+      }
+      return true;
+    },
+    [isFullBlocked, isNoFundsLimited, getLinkedCameraForLock]
+  );
+
+  const canViewCameraArchive = useCallback(
+    (cam: CameraItem | null): boolean => {
+      if (!cam) return false;
+      if (isFullBlocked) return false;
+      if (isNoFundsLimited) {
+        return !isEntranceOrWicketCamera(cam);
+      }
+      return true;
+    },
+    [isFullBlocked, isNoFundsLimited]
+  );
+
+  useEffect(() => {
+    if (
+      activeVideoCamera &&
+      !canViewCameraArchive(activeVideoCamera) &&
+      videoPlaybackMode !== 'live'
+    ) {
+      setVideoPlaybackMode('live');
+      setArchiveTimestampSec(null);
+      setActiveEventId(null);
+    }
+  }, [activeVideoCamera, canViewCameraArchive, videoPlaybackMode]);
+
   // Load camera archive motion events (page 1) when camera or archiveDay changes
   useEffect(() => {
     if (!session || !activeVideoCamera) return;
-    if (isSubscriptionRestricted) {
+    if (!canViewCameraArchive(activeVideoCamera)) {
       setCameraEvents([]);
       setEventsHasMore(false);
       setEventsLoading(false);
@@ -944,7 +1015,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [session, activeVideoCamera, archiveDay, isSubscriptionRestricted]);
+  }, [session, activeVideoCamera, archiveDay, canViewCameraArchive]);
 
   // Load earlier events down to 00:00 when user scrolls to bottom of events list
   const loadMoreCameraEvents = useCallback(async () => {
@@ -1091,8 +1162,12 @@ export default function App() {
   const handleOpenLock = useCallback(
     async (lock: LockItem) => {
       if (!session || unlockingMap[lock.id]) return;
-      if (isSubscriptionRestricted) {
-        showNotice('При неоплаченной или заблокированной подписке доступен только онлайн-просмотр камер');
+      if (!canOpenLock(lock)) {
+        showNotice(
+          isFullBlocked
+            ? 'Аккаунт полностью заблокирован — доступен только онлайн-просмотр камер'
+            : 'При нулевом балансе открытие ворот недоступно (можно открывать только калитки и подъезды)'
+        );
         return;
       }
 
@@ -1145,20 +1220,18 @@ export default function App() {
         setUnlockingMap((prev) => ({ ...prev, [lock.id]: false }));
       }
     },
-    [session, unlockingMap, showNotice, isSubscriptionRestricted, getLinkedCameraForLock]
+    [session, unlockingMap, showNotice, canOpenLock, isFullBlocked, getLinkedCameraForLock]
   );
 
   // Quick actions for Overview ("Открыть дверь" & "Открыть ворота")
   const handleQuickOpenDoor = useCallback(() => {
-    if (isSubscriptionRestricted) {
-      showNotice('Открытие дверей заблокировано до оплаты или разблокировки подписки');
+    if (isFullBlocked) {
+      showNotice('Аккаунт заблокирован — открытие дверей и калиток недоступно');
       return;
     }
     const primaryDoor =
-      filteredLocks.find((l) => {
-        const n = l.name.toLowerCase();
-        return !n.includes('ворот') && !n.includes('шлагбаум');
-      }) || filteredLocks[0];
+      filteredLocks.find((l) => !isGateLock(l, getLinkedCameraForLock(l))) ||
+      filteredLocks.find((l) => canOpenLock(l));
 
     if (primaryDoor) {
       handleOpenLock(primaryDoor);
@@ -1178,18 +1251,19 @@ export default function App() {
     };
     setDoorLogs((prev) => [logEntry, ...prev.slice(0, 19)]);
     showNotice('Входная дверь открыта');
-  }, [filteredLocks, handleOpenLock, places, showNotice, isSubscriptionRestricted]);
+  }, [filteredLocks, handleOpenLock, places, showNotice, isFullBlocked, canOpenLock, getLinkedCameraForLock]);
 
   const handleQuickOpenGate = useCallback(() => {
-    if (isSubscriptionRestricted) {
-      showNotice('Открытие ворот заблокировано до оплаты или разблокировки подписки');
+    if (isFullBlocked || isNoFundsLimited) {
+      showNotice(
+        isFullBlocked
+          ? 'Открытие ворот заблокировано до снятия блокировки'
+          : 'При нулевом балансе открытие ворот недоступно (можно открывать только калитки и подъезды)'
+      );
       return;
     }
     const primaryGate =
-      filteredLocks.find((l) => {
-        const n = l.name.toLowerCase();
-        return n.includes('ворот') || n.includes('калитк') || n.includes('шлагбаум');
-      }) ||
+      filteredLocks.find((l) => isGateLock(l, getLinkedCameraForLock(l))) ||
       filteredLocks[1] ||
       filteredLocks[0];
 
@@ -1210,12 +1284,12 @@ export default function App() {
     };
     setDoorLogs((prev) => [logEntry, ...prev.slice(0, 19)]);
     showNotice('Ворота открыты');
-  }, [filteredLocks, handleOpenLock, places, showNotice, isSubscriptionRestricted]);
+  }, [filteredLocks, handleOpenLock, places, showNotice, isFullBlocked, isNoFundsLimited, getLinkedCameraForLock]);
 
   // Switch to video player for a specific camera (always resets archiveDay to today)
   const handleSelectCameraForVideo = useCallback(
     (camera: CameraItem, mode: 'live' | 'archive') => {
-      const effectiveMode = isSubscriptionRestricted ? 'live' : mode;
+      const effectiveMode = !canViewCameraArchive(camera) ? 'live' : mode;
       pendingSeekTargetRef.current = null;
       setSelectedVideoCameraId((prevId) => {
         if (prevId !== camera.id) {
@@ -1238,7 +1312,7 @@ export default function App() {
       }
       setActiveSection('video');
     },
-    [isSubscriptionRestricted]
+    [canViewCameraArchive]
   );
 
   // Reset archive time & playback mode whenever user leaves the "Видеоархив" tab
@@ -1256,8 +1330,12 @@ export default function App() {
   // Jump directly to a specific camera & timestamp in VideoArchive (used when clicking events)
   const openCameraArchiveAtTimestamp = useCallback(
     (camera: CameraItem, tsSec: number) => {
-      if (isSubscriptionRestricted) {
-        showNotice('Видеоархив недоступен без активной подписки');
+      if (!canViewCameraArchive(camera)) {
+        showNotice(
+          isFullBlocked
+            ? 'Видеоархив недоступен — аккаунт полностью заблокирован'
+            : 'При нулевом балансе архив подъездных камер и калиток недоступен'
+        );
         return;
       }
       const d = new Date(tsSec * 1000);
@@ -1295,13 +1373,13 @@ export default function App() {
       setVideoPlaybackMode('archive_stream');
       setActiveSection('video');
     },
-    [showNotice, isSubscriptionRestricted]
+    [showNotice, canViewCameraArchive, isFullBlocked]
   );
 
   const handleOpenHistoryEvent = useCallback(
     (ev: HistoryEventItem) => {
-      if (isSubscriptionRestricted) {
-        showNotice('Просмотр архива событий недоступен без активной подписки');
+      if (isFullBlocked) {
+        showNotice('Просмотр архива событий недоступен — аккаунт заблокирован');
         return;
       }
       if (cameras.length === 0) {
@@ -1352,16 +1430,21 @@ export default function App() {
         return;
       }
 
+      if (!canViewCameraArchive(matchedCam)) {
+        showNotice('При нулевом балансе архив подъездных камер и калиток недоступен');
+        return;
+      }
+
       const tsSec = ev.timestamp < 1e12 ? ev.timestamp : Math.floor(ev.timestamp / 1000);
       openCameraArchiveAtTimestamp(matchedCam, tsSec);
     },
-    [cameras, openCameraArchiveAtTimestamp, showNotice, isSubscriptionRestricted]
+    [cameras, openCameraArchiveAtTimestamp, showNotice, isFullBlocked, canViewCameraArchive]
   );
 
   const handleOpenDoorLog = useCallback(
     (log: DoorActionLog) => {
-      if (isSubscriptionRestricted) {
-        showNotice('Видеоархив недоступен без активной подписки');
+      if (isFullBlocked) {
+        showNotice('Видеоархив недоступен — аккаунт заблокирован');
         return;
       }
       if (cameras.length === 0) return;
@@ -1390,10 +1473,14 @@ export default function App() {
           ) || cameras[0];
       }
       if (!matchedCam) return;
+      if (!canViewCameraArchive(matchedCam)) {
+        showNotice('При нулевом балансе архив подъездных камер и калиток недоступен');
+        return;
+      }
       const tsSec = log.timestamp < 1e12 ? log.timestamp : Math.floor(log.timestamp / 1000);
       openCameraArchiveAtTimestamp(matchedCam, tsSec);
     },
-    [cameras, locks, openCameraArchiveAtTimestamp, showNotice, isSubscriptionRestricted]
+    [cameras, locks, openCameraArchiveAtTimestamp, showNotice, isFullBlocked, canViewCameraArchive]
   );
 
   const findMatchingEventForTs = useCallback(
@@ -1510,11 +1597,15 @@ export default function App() {
   const handleJumpToArchiveTime = useCallback(
     async (e?: React.FormEvent) => {
       if (e) e.preventDefault();
-      if (isSubscriptionRestricted) {
-        showNotice('Видеоархив недоступен без активной подписки');
+      if (!activeVideoCamera) return;
+      if (!canViewCameraArchive(activeVideoCamera)) {
+        showNotice(
+          isFullBlocked
+            ? 'Видеоархив недоступен — аккаунт полностью заблокирован'
+            : 'При нулевом балансе архив подъездных камер и калиток недоступен'
+        );
         return;
       }
-      if (!activeVideoCamera) return;
       const rawTargetTs = parseArchiveJumpTimestamp();
       if (rawTargetTs == null) {
         showNotice('Укажите время в формате ЧЧ:ММ или ЧЧ:ММ:СС');
@@ -1547,14 +1638,19 @@ export default function App() {
       parseArchiveJumpTimestamp,
       fetchAndMergeEventsAroundTs,
       showNotice,
-      isSubscriptionRestricted,
+      canViewCameraArchive,
+      isFullBlocked,
     ]
   );
 
   const handleDownloadCustomClip = useCallback(async () => {
     if (!session || !activeVideoCamera || downloadingCustomClip) return;
-    if (isSubscriptionRestricted) {
-      showNotice('Скачивание записей архива недоступно без активной подписки');
+    if (!canViewCameraArchive(activeVideoCamera)) {
+      showNotice(
+        isFullBlocked
+          ? 'Скачивание записей архива недоступно — аккаунт заблокирован'
+          : 'При нулевом балансе архив подъездных камер и калиток недоступен'
+      );
       return;
     }
     const rawTargetTs = parseArchiveJumpTimestamp();
@@ -1595,7 +1691,8 @@ export default function App() {
     archiveTimestampSec,
     clipDownloadDurationSec,
     showNotice,
-    isSubscriptionRestricted,
+    canViewCameraArchive,
+    isFullBlocked,
   ]);
 
   const handleToggleDnd = async (placeId: string, itemType: string) => {
@@ -1794,6 +1891,7 @@ export default function App() {
   })();
 
   const activeCameraLinkedLock = getLinkedLockForCamera(activeVideoCamera);
+  const activeVideoCanArchive = canViewCameraArchive(activeVideoCamera);
   const availableRetentionDays = getRecentDays(
     Math.max(1, Math.min(7, activeVideoCamera?.retentionDays || 7))
   );
@@ -1986,7 +2084,7 @@ export default function App() {
                 className="relative p-2 rounded-full text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer"
               >
                 <Bell className="w-5 h-5" />
-                {!isSubscriptionRestricted && (doorLogs.length > 0 || placeHistory.length > 0) && (
+                {!isFullBlocked && (doorLogs.length > 0 || placeHistory.length > 0) && (
                   <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#2563EB] ring-2 ring-white dark:ring-[#12161f]" />
                 )}
               </button>
@@ -2003,9 +2101,9 @@ export default function App() {
                       <X className="w-3.5 h-3.5" />
                     </button>
                   </div>
-                  {isSubscriptionRestricted ? (
+                  {isFullBlocked ? (
                     <div className="py-3 text-slate-400 text-center">
-                      Уведомления и журнал недоступны без активной подписки
+                      Уведомления и журнал отключены при полной блокировке
                     </div>
                   ) : doorLogs.length === 0 && placeHistory.length === 0 ? (
                     <div className="py-3 text-slate-400 text-center">
@@ -2201,12 +2299,14 @@ export default function App() {
                 <Lock className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
                 <div className="space-y-0.5">
                   <div className="font-bold">
-                    {billingMe?.user.status === 'blocked'
-                      ? 'Аккаунт заблокирован — доступен только онлайн-просмотр камер'
-                      : 'Подписка не оплачена или истекла — доступен только онлайн-просмотр камер'}
+                    {isFullBlocked
+                      ? 'Аккаунт полностью заблокирован — доступен только онлайн-просмотр камер'
+                      : 'Недостаточно средств (баланс 0 ₽) — действуют ограничения тарифа'}
                   </div>
                   <div className="text-amber-800/80 dark:text-amber-200/80">
-                    Открытие дверей и ворот, архив записей, события и гостевой доступ отключены.
+                    {isFullBlocked
+                      ? 'Открытие дверей и ворот, архив записей, переименование камер, события и управление доступом отключены.'
+                      : 'Доступны камеры онлайн, открытие калиток/подъездов и архив дворовых камер. Ворота, архив входов, переименование камер и «Управление доступом» отключены.'}
                   </div>
                 </div>
               </div>
@@ -2215,7 +2315,7 @@ export default function App() {
                 onClick={() => setActiveSection('settings')}
                 className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
-                {billingMe?.user.status === 'blocked' ? 'Подробнее' : 'Оплатить подписку'}
+                {isFullBlocked ? 'Подробнее' : 'Пополнить баланс'}
               </button>
             </div>
           )}
@@ -2268,6 +2368,7 @@ export default function App() {
               onRenameCamera={handleRenameCamera}
               onNotice={showNotice}
               isRestricted={isSubscriptionRestricted}
+              restrictionMode={restrictionMode}
             />
           )}
 
@@ -2401,22 +2502,28 @@ export default function App() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-                  {filteredCameras.map((cam) => (
-                    <CameraSnapshotCard
-                      key={cam.id}
-                      session={session}
-                      camera={cam}
-                      linkedLock={getLinkedLockForCamera(cam)}
-                      refreshTick={snapshotRefreshTick}
-                      onSelectForVideo={handleSelectCameraForVideo}
-                      onInspectSnapshot={(camera, url) => setLightboxCamera({ camera, url })}
-                      onUnlockLinked={handleOpenLock}
-                      onToggleFavorite={handleToggleCameraFavorite}
-                      onRenameCamera={handleRenameCamera}
-                      onNotice={showNotice}
-                      isRestricted={isSubscriptionRestricted}
-                    />
-                  ))}
+                  {filteredCameras.map((cam) => {
+                    const linked = getLinkedLockForCamera(cam);
+                    return (
+                      <CameraSnapshotCard
+                        key={cam.id}
+                        session={session}
+                        camera={cam}
+                        linkedLock={linked}
+                        refreshTick={snapshotRefreshTick}
+                        onSelectForVideo={handleSelectCameraForVideo}
+                        onInspectSnapshot={(camera, url) => setLightboxCamera({ camera, url })}
+                        onUnlockLinked={handleOpenLock}
+                        onToggleFavorite={handleToggleCameraFavorite}
+                        onRenameCamera={handleRenameCamera}
+                        onNotice={showNotice}
+                        isRestricted={isSubscriptionRestricted}
+                        canViewArchive={canViewCameraArchive(cam)}
+                        canOpenLinkedLock={Boolean(linked && canOpenLock(linked))}
+                        canRename={!isSubscriptionRestricted}
+                      />
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -2430,12 +2537,14 @@ export default function App() {
               <div className="flex flex-wrap items-end justify-between gap-4">
                 <div>
                   <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100 font-display">
-                    {isSubscriptionRestricted ? 'Онлайн-просмотр камер' : 'Видеоархив'}
+                    {!activeVideoCanArchive ? 'Онлайн-просмотр камер' : 'Видеоархив'}
                   </h1>
                   <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-                    {isSubscriptionRestricted
+                    {isFullBlocked
                       ? 'Доступен только прямой эфир камер — архив записей и скачивание MP4 заблокированы'
-                      : 'Просмотр записей по времени, управление скоростью (0.5×–4×) и скачивание MP4'}
+                      : !activeVideoCanArchive
+                        ? 'Для подъездных камер и калиток при нулевом балансе доступен только прямой эфир (архив дворовых и фасадных камер открыт)'
+                        : 'Просмотр записей по времени, управление скоростью (0.5×–4×) и скачивание MP4'}
                   </p>
                 </div>
 
@@ -2456,7 +2565,7 @@ export default function App() {
                     <Play className="w-3.5 h-3.5 fill-current" />
                     <span>Прямой эфир</span>
                   </button>
-                  {!isSubscriptionRestricted && (
+                  {activeVideoCanArchive && (
                     <button
                       type="button"
                       onClick={() => {
@@ -2541,7 +2650,7 @@ export default function App() {
                             refreshTick={snapshotRefreshTick}
                           />
 
-                          {isRenamingThis ? (
+                          {isRenamingThis && !isSubscriptionRestricted ? (
                             <form
                               onClick={(e) => e.stopPropagation()}
                               onSubmit={async (e) => {
@@ -2630,18 +2739,20 @@ export default function App() {
                               </div>
 
                               <div className="flex items-center gap-1 shrink-0">
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setRenamingSidebarCameraId(cam.id);
-                                    setRenamingSidebarDraft(cam.name);
-                                  }}
-                                  title="Переименовать камеру"
-                                  className="p-1.5 rounded-lg text-slate-400 hover:text-[#2563EB] dark:hover:text-[#3B82F6] hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer"
-                                >
-                                  <Pencil className="w-3.5 h-3.5" />
-                                </button>
+                                {!isSubscriptionRestricted && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setRenamingSidebarCameraId(cam.id);
+                                      setRenamingSidebarDraft(cam.name);
+                                    }}
+                                    title="Переименовать камеру"
+                                    className="p-1.5 rounded-lg text-slate-400 hover:text-[#2563EB] dark:hover:text-[#3B82F6] hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer"
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
 
                                 <button
                                   type="button"
@@ -2667,7 +2778,7 @@ export default function App() {
                                   />
                                 </button>
 
-                                {!isSubscriptionRestricted && lockForCam && lockForCam.openable && (
+                                {lockForCam && canOpenLock(lockForCam) && (
                                   <button
                                     type="button"
                                     disabled={Boolean(unlockingMap[lockForCam.id])}
@@ -2766,7 +2877,7 @@ export default function App() {
                         }}
                       />
 
-                      {isSubscriptionRestricted ? (
+                      {!activeVideoCanArchive ? (
                         <div className="p-6 bg-white dark:bg-[#1a202c] border border-slate-200 dark:border-white/[0.06] rounded-2xl flex flex-wrap items-center justify-between gap-4">
                           <div className="flex items-center gap-3 min-w-0">
                             <div className="w-10 h-10 rounded-xl bg-amber-500/10 text-amber-500 flex items-center justify-center shrink-0">
@@ -2774,10 +2885,14 @@ export default function App() {
                             </div>
                             <div className="space-y-0.5 text-xs">
                               <div className="text-sm font-bold text-slate-900 dark:text-white">
-                                Видеоархив и события заблокированы
+                                {isFullBlocked
+                                  ? 'Видеоархив и события заблокированы'
+                                  : 'Архив подъездных камер и калиток ограничен'}
                               </div>
                               <div className="text-slate-500 dark:text-slate-400">
-                                Перемотка архива, журнал движений и скачивание MP4 недоступны без активной подписки.
+                                {isFullBlocked
+                                  ? 'При полной блокировке перемотка архива, журнал движений и скачивание MP4 недоступны.'
+                                  : 'При нулевом балансе архив и события подъездных домофонов и калиток недоступны — выберите дворовую или фасадную камеру либо пополните баланс.'}
                               </div>
                             </div>
                           </div>
@@ -2786,7 +2901,7 @@ export default function App() {
                             onClick={() => setActiveSection('settings')}
                             className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap"
                           >
-                            Оплатить подписку
+                            {isFullBlocked ? 'Подробнее' : 'Пополнить баланс'}
                           </button>
                         </div>
                       ) : (
@@ -3030,9 +3145,11 @@ export default function App() {
               <div className="w-12 h-12 rounded-2xl bg-amber-500/10 text-amber-500 flex items-center justify-center">
                 <Lock className="w-6 h-6" />
               </div>
-              <h1 className="text-xl font-bold font-display">Управление доступом заблокировано</h1>
+              <h1 className="text-xl font-bold font-display">Раздел «Управление доступом» заблокирован</h1>
               <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
-                Открытие дверей, калиток и ворот, настройка контроллера и создание гостевых ссылок недоступны при неоплаченной или заблокированной подписке. Вы можете смотреть камеры онлайн или оплатить подписку.
+                {isFullBlocked
+                  ? 'Аккаунт полностью заблокирован администратором. Открытие дверей и ворот, настройка контроллера ESP32 и создание гостевых ссылок отключены — доступен только онлайн-просмотр камер.'
+                  : 'При нулевом балансе раздел «Управление доступом» (настройка ворот ESP32 и создание гостевых ссылок) недоступен. На странице «Обзор» и «Камеры» по-прежнему можно смотреть камеры онлайн и открывать калитки и подъезды.'}
               </p>
               <div className="flex flex-wrap gap-3 pt-1">
                 <button
@@ -3040,14 +3157,14 @@ export default function App() {
                   onClick={() => setActiveSection('settings')}
                   className="px-4 py-2.5 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer transition-colors"
                 >
-                  Оплатить подписку
+                  {isFullBlocked ? 'Подробнее' : 'Пополнить баланс'}
                 </button>
                 <button
                   type="button"
                   onClick={() => setActiveSection('cameras')}
                   className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.1] text-slate-800 dark:text-slate-200 text-xs font-semibold cursor-pointer transition-colors"
                 >
-                  Смотреть камеры онлайн
+                  {isFullBlocked ? 'Смотреть камеры онлайн' : 'Камеры и доступные входы'}
                 </button>
               </div>
             </div>
@@ -3650,7 +3767,9 @@ void loop() {
               </div>
               <h1 className="text-xl font-bold font-display">Раздел «Пользователи и адреса» заблокирован</h1>
               <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
-                Управление профилем и гостевым доступом отключено при неоплаченной или заблокированной подписке. Доступен только онлайн-просмотр камер.
+                {isFullBlocked
+                  ? 'Управление профилем и гостевым доступом отключено при полной блокировке аккаунта. Доступен только онлайн-просмотр камер.'
+                  : 'Управление профилем и гостевым доступом отключено при нулевом балансе. Вы можете пополнить баланс или пользоваться онлайн-камерами и калитками/подъездом.'}
               </p>
               <div className="flex flex-wrap gap-3 pt-1">
                 <button
@@ -3658,14 +3777,14 @@ void loop() {
                   onClick={() => setActiveSection('settings')}
                   className="px-4 py-2.5 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer transition-colors"
                 >
-                  Оплатить подписку
+                  {isFullBlocked ? 'Подробнее' : 'Пополнить баланс'}
                 </button>
                 <button
                   type="button"
                   onClick={() => setActiveSection('cameras')}
                   className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.1] text-slate-800 dark:text-slate-200 text-xs font-semibold cursor-pointer transition-colors"
                 >
-                  Смотреть камеры онлайн
+                  {isFullBlocked ? 'Смотреть камеры онлайн' : 'Камеры и доступные входы'}
                 </button>
               </div>
             </div>
@@ -3760,17 +3879,17 @@ void loop() {
                         {billingMe.user.status === 'active'
                           ? `Активна до ${new Date(billingMe.user.paidUntil || Date.now()).toLocaleDateString('ru-RU')}`
                           : billingMe.user.status === 'trial'
-                            ? `Пробный период до ${new Date(billingMe.user.trialEndsAt).toLocaleDateString('ru-RU')}`
+                            ? `Пробный период (подарок на ${billingMe.config.trialDays} дн.) до ${new Date(billingMe.user.trialEndsAt).toLocaleDateString('ru-RU')}`
                             : billingMe.user.status === 'blocked'
-                              ? 'Доступ ограничен администратором'
-                              : 'Срок действия истёк — пополните баланс или продлите подписку'}
+                              ? 'Полная блокировка администратором — доступен только онлайн-просмотр камер'
+                              : 'Нет средств (баланс 0 ₽) — доступны камеры онлайн, калитки, подъезды и архив дворовых камер'}
                       </div>
                     </div>
 
                     <div className="text-right">
                       <div className="text-[11px] text-slate-400">Баланс сервиса</div>
                       <div className="text-xl font-bold text-slate-900 dark:text-white font-mono tabular-nums">
-                        {billingMe.user.balanceRub.toFixed(0)} ₽
+                        {formatRub(billingMe.user.balanceRub)} ₽
                       </div>
                     </div>
                   </div>

@@ -71,6 +71,12 @@ function formatDateTime(ms: number | null | undefined): string {
   });
 }
 
+function formatRub(amount: number): string {
+  const n = Number(amount || 0);
+  if (!Number.isFinite(n)) return '0';
+  return Math.abs(n - Math.round(n)) < 0.005 ? String(Math.round(n)) : n.toFixed(2);
+}
+
 function renderStatusLabel(user: BillingUserRecord): {
   label: string;
   sub: string;
@@ -79,8 +85,8 @@ function renderStatusLabel(user: BillingUserRecord): {
 } {
   if (user.status === 'blocked') {
     return {
-      label: 'Заблокирован',
-      sub: 'Доступ ограничен',
+      label: 'Полная блокировка',
+      sub: 'Только онлайн-камеры',
       colorClass: 'text-rose-500',
       icon: <Ban className="w-3.5 h-3.5 shrink-0" />,
     };
@@ -95,16 +101,16 @@ function renderStatusLabel(user: BillingUserRecord): {
   }
   if (user.status === 'trial') {
     return {
-      label: 'Пробный период',
+      label: 'Пробный (подарок)',
       sub: `до ${formatShortDate(user.trialEndsAt)}`,
       colorClass: 'text-amber-600 dark:text-amber-400',
       icon: <Clock className="w-3.5 h-3.5 shrink-0" />,
     };
   }
   return {
-    label: 'Истекла',
-    sub: user.paidUntil ? `была до ${formatShortDate(user.paidUntil)}` : 'Требует оплаты',
-    colorClass: 'text-rose-500',
+    label: 'Нет средств (лимит)',
+    sub: 'Калитки/подъезд · без ворот',
+    colorClass: 'text-amber-600 dark:text-amber-400',
     icon: <Clock className="w-3.5 h-3.5 shrink-0" />,
   };
 }
@@ -263,7 +269,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
   const handleQuickSubAction = async (
     userId: string,
-    payload: { status?: BillingSubscriptionStatus; addDays?: number; role?: 'admin' | 'user' },
+    payload: {
+      status?: BillingSubscriptionStatus;
+      action?: 'unblock';
+      addDays?: number;
+      role?: 'admin' | 'user';
+    },
     successMsg: string
   ) => {
     setBusyId(userId);
@@ -542,7 +553,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               <span>Балансы пользователей</span>
             </div>
             <div className="text-2xl font-bold text-slate-900 dark:text-white font-mono tabular-nums">
-              {overview.stats.totalUserBalancesRub.toFixed(0)} ₽
+              {formatRub(overview.stats.totalUserBalancesRub)} ₽
             </div>
             <div className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
               Тариф {overview.config.monthlyPriceRub} ₽ / 30 дн.
@@ -736,9 +747,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 />
                 <input
                   type="number"
+                  step="0.01"
                   value={newBalance}
                   onChange={(e) => setNewBalance(e.target.value)}
-                  placeholder="Начальный баланс (₽)"
+                  placeholder="Начальный баланс (0 = подарок 7 дн.)"
                   className="px-3 py-2 rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10 font-mono focus:outline-none"
                 />
                 <select
@@ -746,9 +758,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   onChange={(e) => setNewStatus(e.target.value as BillingSubscriptionStatus)}
                   className="px-3 py-2 rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10 focus:outline-none"
                 >
-                  <option value="trial">Пробный период (7 дн.)</option>
+                  <option value="trial">Пробный (подарок на 7 дн.)</option>
                   <option value="active">Активна (30 дн.)</option>
-                  <option value="expired">Истекла</option>
+                  <option value="expired">Нет средств (лимит)</option>
+                  <option value="blocked">Полная блокировка</option>
                 </select>
               </div>
               <div className="flex justify-end">
@@ -782,8 +795,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     { id: 'all', label: 'Все' },
                     { id: 'active', label: 'Активные' },
                     { id: 'trial', label: 'Триал' },
-                    { id: 'expired', label: 'Истекшие' },
-                    { id: 'blocked', label: 'Заблок.' },
+                    { id: 'expired', label: 'Нет средств' },
+                    { id: 'blocked', label: 'Полная блок.' },
                   ] as const
                 ).map((st) => (
                   <button
@@ -851,7 +864,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         {/* Balance */}
                         <div className="w-28 shrink-0 text-right">
                           <div className="text-sm font-bold text-slate-900 dark:text-white font-mono tabular-nums">
-                            {user.balanceRub.toFixed(0)} ₽
+                            {formatRub(user.balanceRub)} ₽
                           </div>
                           <div className="text-[11px] text-slate-400">
                             {user.autoRenew ? 'Автопродление' : 'Вручную'}
@@ -903,16 +916,42 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             <span>+30 дн.</span>
                           </button>
 
+                          {user.status !== 'blocked' && user.status !== 'expired' && (
+                            <button
+                              type="button"
+                              disabled={busyId === user.userId}
+                              title="Частичная блокировка (Нет средств): только онлайн, калитки/подъезд, без ворот и без архива входов"
+                              onClick={() =>
+                                handleQuickSubAction(
+                                  user.userId,
+                                  { status: 'expired' },
+                                  `Для «${user.name}» включён режим «Нет средств (лимит)»`
+                                )
+                              }
+                              className="px-2.5 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 font-medium inline-flex items-center gap-1 cursor-pointer"
+                            >
+                              <Clock className="w-3.5 h-3.5" />
+                              <span>Лимит</span>
+                            </button>
+                          )}
+
                           <button
                             type="button"
                             disabled={busyId === user.userId}
+                            title={
+                              user.status === 'blocked'
+                                ? 'Снять блокировку и восстановить фактический статус по сроку/балансу'
+                                : 'Полная блокировка: доступен только онлайн-просмотр камер'
+                            }
                             onClick={() =>
                               handleQuickSubAction(
                                 user.userId,
-                                { status: user.status === 'blocked' ? 'active' : 'blocked' },
                                 user.status === 'blocked'
-                                  ? `Пользователь «${user.name}» разблокирован`
-                                  : `Пользователь «${user.name}» заблокирован`
+                                  ? { action: 'unblock' }
+                                  : { status: 'blocked' },
+                                user.status === 'blocked'
+                                  ? `Блокировка «${user.name}» снята`
+                                  : `Пользователь «${user.name}» полностью заблокирован`
                               )
                             }
                             className={`px-2.5 py-1.5 rounded-lg font-medium inline-flex items-center gap-1 cursor-pointer ${
@@ -929,7 +968,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             ) : (
                               <>
                                 <Ban className="w-3.5 h-3.5" />
-                                <span>Блок</span>
+                                <span>Полн. блок</span>
                               </>
                             )}
                           </button>
