@@ -2292,10 +2292,10 @@ export default function App() {
         )}
 
         {/* Main Workspace Container */}
-        <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-8 py-6 sm:py-7">
+        <main className="flex-1 max-w-6xl w-full mx-auto px-3 sm:px-8 py-4 sm:py-7">
           {isSubscriptionRestricted && activeSection !== 'settings' && activeSection !== 'about' && activeSection !== 'admin' && (
-            <div className="mb-6 p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/35 border border-amber-300/70 dark:border-amber-500/35 flex flex-wrap items-center justify-between gap-4 text-xs text-amber-900 dark:text-amber-100">
-              <div className="flex items-center gap-3 min-w-0">
+            <div className="mb-4 sm:mb-6 p-3 sm:p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/35 border border-amber-300/70 dark:border-amber-500/35 flex flex-wrap items-center justify-between gap-2.5 sm:gap-4 text-xs text-amber-900 dark:text-amber-100">
+              <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
                 <Lock className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
                 <div className="space-y-0.5">
                   <div className="font-bold">
@@ -2313,7 +2313,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setActiveSection('settings')}
-                className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+                className="px-3.5 py-1.5 sm:px-4 sm:py-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
                 {isFullBlocked ? 'Подробнее' : 'Пополнить баланс'}
               </button>
