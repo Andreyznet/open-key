@@ -177,8 +177,20 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
 
   return (
     <div className="flex flex-col bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06] rounded-2xl overflow-hidden shadow-[0_2px_10px_rgba(15,23,42,0.03)] hover:border-slate-300 dark:hover:border-white/15 transition-all">
-      {/* Snapshot Viewport */}
-      <div className="relative aspect-video w-full bg-[#0b0f17] overflow-hidden group">
+      {/* Snapshot Viewport — clicking/tapping opens online player */}
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => onSelectForVideo(camera, 'live')}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onSelectForVideo(camera, 'live');
+          }
+        }}
+        title={`Открыть прямой эфир «${camera.name}»`}
+        className="relative aspect-video w-full bg-[#0b0f17] overflow-hidden group cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
+      >
         <CachedCameraImage
           session={session}
           camera={camera}
@@ -201,7 +213,10 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => onSelectForVideo(camera, 'live')}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectForVideo(camera, 'live');
+              }}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-[#2563EB] hover:bg-blue-700 text-white rounded-xl shadow-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Play className="w-3.5 h-3.5 fill-current" />
@@ -210,7 +225,10 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
             {effectiveCanViewArchive && (
               <button
                 type="button"
-                onClick={() => onSelectForVideo(camera, 'archive')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelectForVideo(camera, 'archive');
+                }}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-black/65 hover:bg-black/85 text-white border border-white/15 rounded-xl backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <History className="w-3.5 h-3.5" />
@@ -222,7 +240,10 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
           <div className="flex items-center gap-1.5">
             <button
               type="button"
-              onClick={handleDownloadSnapshot}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleDownloadSnapshot();
+              }}
               className="p-2 rounded-xl bg-black/65 hover:bg-black/85 text-white border border-white/15 backdrop-blur-sm transition-colors cursor-pointer"
               title="Скачать снимок"
             >
@@ -230,9 +251,12 @@ export const CameraSnapshotCard: React.FC<CameraSnapshotCardProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => onInspectSnapshot(camera, snapshotUrl)}
+              onClick={(e) => {
+                e.stopPropagation();
+                onInspectSnapshot(camera, snapshotUrl);
+              }}
               className="p-2 rounded-xl bg-black/65 hover:bg-black/85 text-white border border-white/15 backdrop-blur-sm transition-colors cursor-pointer"
-              title="Развернуть на весь экран"
+              title="Развернуть снимок на весь экран"
             >
               <Maximize2 className="w-3.5 h-3.5" />
             </button>

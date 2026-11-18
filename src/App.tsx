@@ -1231,13 +1231,17 @@ export default function App() {
         setJumpTimeInput(formatUnixTime(Math.floor(Date.now() / 1000) - 300));
       } else {
         setVideoPlaybackMode('archive_stream');
-        const defaultTs = Math.floor(Date.now() / 1000) - 300;
+        const nowLimit = Math.floor(Date.now() / 1000) - 5;
+        const knownMin = archiveMinTsByCamera[camera.id];
+        const rawTs = Math.floor(Date.now() / 1000) - 300;
+        const defaultTs =
+          knownMin != null && rawTs < knownMin ? Math.min(nowLimit, knownMin + 6) : rawTs;
         setArchiveTimestampSec(defaultTs);
         setJumpTimeInput(formatUnixTime(defaultTs));
       }
       setActiveSection('video');
     },
-    [canViewCameraArchive]
+    [canViewCameraArchive, archiveMinTsByCamera]
   );
 
   // Reset archive time & playback mode whenever user leaves the "Видеоархив" tab
@@ -2505,7 +2509,7 @@ export default function App() {
                         const rawTs = archiveTimestampSec || fallbackTs;
                         const defaultTs =
                           knownMin != null && rawTs < knownMin
-                            ? Math.min(nowLimit, knownMin + 5)
+                            ? Math.min(nowLimit, knownMin + 6)
                             : rawTs;
                         setArchiveTimestampSec(defaultTs);
                         setActiveEventId(null);
@@ -2525,221 +2529,8 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                <div className="lg:col-span-4 bg-white dark:bg-[#1a202c] border border-slate-200 dark:border-white/[0.06] rounded-2xl overflow-hidden">
-                  <div className="px-4 py-3 border-b border-slate-200 dark:border-white/[0.06] flex items-center justify-between">
-                    <span className="text-xs font-semibold">
-                      Камеры ({placeVisibleCameras.length})
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setSnapshotRefreshTick(Date.now())}
-                      title="Обновить снимки камер"
-                      className="p-1 rounded-lg text-slate-400 hover:text-[#2563EB] dark:hover:text-[#3B82F6] hover:bg-slate-100 dark:hover:bg-white/[0.05] transition-colors cursor-pointer"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                  <div className="divide-y divide-slate-100 dark:divide-white/[0.06] max-h-[600px] overflow-y-auto">
-                    {placeVisibleCameras.map((cam) => {
-                      const isSelected = activeVideoCamera?.id === cam.id;
-                      const lockForCam = getLinkedLockForCamera(cam);
-                      const isRenamingThis = renamingSidebarCameraId === cam.id;
-                      const isCustomRenamed = Boolean(
-                        cam.originalName && cam.originalName.trim() !== cam.name.trim()
-                      );
-
-                      return (
-                        <div
-                          key={cam.id}
-                          className={`p-3 transition-colors flex items-center justify-between gap-2.5 cursor-pointer ${
-                            isSelected
-                              ? 'bg-[#2563EB]/10 text-[#2563EB] dark:text-white'
-                              : 'hover:bg-slate-50 dark:hover:bg-white/[0.03]'
-                          }`}
-                          onClick={() => {
-                            if (isRenamingThis) return;
-                            if (activeVideoCamera?.id !== cam.id) {
-                              setSelectedVideoCameraId(cam.id);
-                              setArchiveDay(getRecentDays(1)[0]);
-                              setActiveEventId(null);
-                              setInitialClipSeekSec(0);
-                              setCameraEvents([]);
-                              setArchiveTimestampSec(null);
-                              setVideoPlaybackMode('live');
-                              setJumpTimeInput(
-                                formatUnixTime(Math.floor(Date.now() / 1000) - 300)
-                              );
-                            }
-                          }}
-                        >
-                          <ArchiveCameraThumb
-                            session={session}
-                            camera={cam}
-                            refreshTick={snapshotRefreshTick}
-                          />
-
-                          {isRenamingThis && !isSubscriptionRestricted ? (
-                            <form
-                              onClick={(e) => e.stopPropagation()}
-                              onSubmit={async (e) => {
-                                e.preventDefault();
-                                if (renamingSidebarSaving) return;
-                                setRenamingSidebarSaving(true);
-                                try {
-                                  await handleRenameCamera(cam, renamingSidebarDraft);
-                                  setRenamingSidebarCameraId(null);
-                                } finally {
-                                  setRenamingSidebarSaving(false);
-                                }
-                              }}
-                              className="min-w-0 flex-1 flex items-center gap-1"
-                            >
-                              <input
-                                type="text"
-                                value={renamingSidebarDraft}
-                                onChange={(e) => setRenamingSidebarDraft(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Escape') {
-                                    setRenamingSidebarCameraId(null);
-                                  }
-                                }}
-                                maxLength={80}
-                                autoFocus
-                                disabled={renamingSidebarSaving}
-                                placeholder={cam.originalName || 'Название камеры'}
-                                className="flex-1 min-w-0 px-2 py-1 text-xs font-semibold bg-white dark:bg-[#12161f] border border-[#2563EB]/60 rounded-lg text-slate-900 dark:text-white focus:outline-none"
-                              />
-                              <button
-                                type="submit"
-                                disabled={renamingSidebarSaving}
-                                title="Сохранить"
-                                className="p-1.5 rounded-lg bg-[#2563EB] hover:bg-blue-700 text-white shrink-0 cursor-pointer"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              {isCustomRenamed && (
-                                <button
-                                  type="button"
-                                  disabled={renamingSidebarSaving}
-                                  onClick={async () => {
-                                    setRenamingSidebarSaving(true);
-                                    try {
-                                      await handleRenameCamera(cam, '');
-                                      setRenamingSidebarCameraId(null);
-                                    } finally {
-                                      setRenamingSidebarSaving(false);
-                                    }
-                                  }}
-                                  title={`Сбросить на «${cam.originalName}»`}
-                                  className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.12] text-slate-600 dark:text-slate-300 shrink-0 cursor-pointer"
-                                >
-                                  <RotateCcw className="w-3 h-3" />
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                disabled={renamingSidebarSaving}
-                                onClick={() => setRenamingSidebarCameraId(null)}
-                                title="Отмена"
-                                className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.12] text-slate-500 dark:text-slate-400 shrink-0 cursor-pointer"
-                              >
-                                <X className="w-3 h-3" />
-                              </button>
-                            </form>
-                          ) : (
-                            <>
-                              <div className="min-w-0 flex-1 space-y-0.5">
-                                <div
-                                  className="text-xs font-semibold truncate"
-                                  title={
-                                    isCustomRenamed
-                                      ? `${cam.name} (Исходное: ${cam.originalName})`
-                                      : cam.name
-                                  }
-                                >
-                                  {cam.name}
-                                </div>
-                                <div className="text-[11px] text-slate-400 font-mono tabular-nums truncate">
-                                  {isCustomRenamed
-                                    ? `Исходное: ${cam.originalName}`
-                                    : `Архив ${cam.retentionDays} дн.`}
-                                </div>
-                              </div>
-
-                              <div className="flex items-center gap-1 shrink-0">
-                                {!isSubscriptionRestricted && (
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setRenamingSidebarCameraId(cam.id);
-                                      setRenamingSidebarDraft(cam.name);
-                                    }}
-                                    title="Переименовать камеру"
-                                    className="p-1.5 rounded-lg text-slate-400 hover:text-[#2563EB] dark:hover:text-[#3B82F6] hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer"
-                                  >
-                                    <Pencil className="w-3.5 h-3.5" />
-                                  </button>
-                                )}
-
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleToggleCameraFavorite(cam);
-                                  }}
-                                  title={
-                                    cam.favorite
-                                      ? 'Убрать из избранного'
-                                      : 'Добавить в избранное'
-                                  }
-                                  className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                                    cam.favorite
-                                      ? 'text-amber-400 hover:bg-amber-500/10'
-                                      : 'text-slate-400 hover:text-amber-400 hover:bg-slate-100 dark:hover:bg-white/[0.06]'
-                                  }`}
-                                >
-                                  <Star
-                                    className={`w-3.5 h-3.5 ${
-                                      cam.favorite ? 'fill-amber-400 text-amber-400' : ''
-                                    }`}
-                                  />
-                                </button>
-
-                                {lockForCam && canOpenLock(lockForCam) && (
-                                  <button
-                                    type="button"
-                                    disabled={Boolean(unlockingMap[lockForCam.id])}
-                                    title={`Открыть: ${lockForCam.name}`}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handleOpenLock(lockForCam);
-                                    }}
-                                    className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-all whitespace-nowrap shrink-0 active:scale-[0.97] ${
-                                      unlockedMap[lockForCam.id]
-                                        ? 'bg-emerald-600 border-emerald-600 text-white cursor-pointer'
-                                        : unlockingMap[lockForCam.id]
-                                        ? 'bg-slate-200 dark:bg-white/10 border-slate-300 dark:border-white/10 text-slate-500 cursor-wait'
-                                        : 'bg-slate-100 dark:bg-slate-800 border-slate-200/90 dark:border-white/10 text-slate-800 dark:text-slate-200 hover:bg-[#2563EB] hover:border-[#2563EB] hover:text-white dark:hover:bg-[#2563EB] dark:hover:border-[#2563EB] dark:hover:text-white hover:shadow-sm cursor-pointer'
-                                    }`}
-                                  >
-                                    {unlockingMap[lockForCam.id]
-                                      ? 'Открытие...'
-                                      : unlockedMap[lockForCam.id]
-                                      ? 'Открыто'
-                                      : 'Открыть'}
-                                  </button>
-                                )}
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="lg:col-span-8 space-y-6">
+                {/* Left Column: Video Player & Archive Events */}
+                <div className="lg:col-span-8 space-y-6 min-w-0">
                   {activeVideoCamera ? (
                     <>
                       <CameraFeedPlayer
@@ -2762,13 +2553,41 @@ export default function App() {
                             ? Boolean(unlockedMap[activeCameraLinkedLock.id])
                             : false
                         }
+                        linkedLock={activeCameraLinkedLock}
+                        canOpenLock={Boolean(activeCameraLinkedLock && canOpenLock(activeCameraLinkedLock))}
+                        isUnlocking={Boolean(
+                          activeCameraLinkedLock && unlockingMap[activeCameraLinkedLock.id]
+                        )}
+                        canViewArchive={activeVideoCanArchive}
+                        events={cameraEvents}
+                        availableDays={availableRetentionDays}
+                        onOpenLock={handleOpenLock}
+                        onSwitchToLive={() => {
+                          setVideoPlaybackMode('live');
+                          setArchiveTimestampSec(null);
+                          setActiveEventId(null);
+                        }}
+                        onChangeArchiveDay={(dayStr) => {
+                          setArchiveDay(dayStr);
+                        }}
+                        onOpenEvent={(ev) => {
+                          const isLong = (ev.duration || 0) > 300;
+                          setInitialClipSeekSec(0);
+                          setArchiveTimestampSec(ev.timestamp);
+                          setActiveEventId(ev.id);
+                          setVideoPlaybackMode(
+                            !isLong && activeVideoCamera.videoDownloadAvailable !== false
+                              ? 'event_mp4'
+                              : 'archive_stream'
+                          );
+                        }}
                         onCaptureNotice={showNotice}
                         onDiscoverMinAvailableTs={(camId, minTs) => {
                           setArchiveMinTsByCamera((prev) => ({ ...prev, [camId]: minTs }));
                         }}
                         onRequestFallbackEventMp4={(targetTs) => {
-                          // Only fallback to an event MP4 if targetTs strictly falls inside that event's recording window
-                          const matched = findMatchingEventForTs(targetTs, cameraEvents, 0);
+                          // Fallback to event MP4 if targetTs falls inside or close to a recorded event window
+                          const matched = findMatchingEventForTs(targetTs, cameraEvents, 120);
                           if (matched && activeVideoCamera.videoDownloadAvailable !== false) {
                             const endTs = matched.timestamp + Math.max(20, matched.duration || 30);
                             const offsetSec =
@@ -2802,6 +2621,10 @@ export default function App() {
                           setArchiveTimestampSec(newTs);
                           setActiveEventId(null);
                           setVideoPlaybackMode('archive_stream');
+                          const d = new Date(newTs * 1000);
+                          const pad = (n: number) => String(n).padStart(2, '0');
+                          const nextDay = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+                          setArchiveDay((prev) => (prev === nextDay ? prev : nextDay));
                         }}
                       />
 
@@ -2948,7 +2771,7 @@ export default function App() {
                                   loadMoreCameraEvents();
                                 }
                               }}
-                              className="divide-y divide-slate-100 dark:divide-white/[0.06] max-h-80 overflow-y-auto pr-1"
+                              className="divide-y divide-slate-100 dark:divide-white/[0.06] max-h-80 overflow-y-auto overflow-x-hidden pr-1"
                             >
                               {cameraEvents.map((ev) => {
                                 const startStr = formatUnixTime(ev.timestamp);
@@ -2959,13 +2782,13 @@ export default function App() {
                                 return (
                                   <div
                                     key={ev.id}
-                                    className={`py-2.5 px-2 -mx-2 rounded-lg flex items-center justify-between gap-3 text-xs transition-colors ${
+                                    className={`py-2.5 px-2.5 rounded-lg flex items-center justify-between gap-3 text-xs transition-colors ${
                                       isActiveEvent
                                         ? 'bg-[#2563EB]/10 border border-[#2563EB]/30'
                                         : ''
                                     }`}
                                   >
-                                    <div>
+                                    <div className="min-w-0">
                                       <span className="font-mono font-semibold">{startStr}</span>
                                       <span className="text-slate-400 ml-2">
                                         ({formatDuration(ev.duration)})
@@ -2976,7 +2799,7 @@ export default function App() {
                                         </span>
                                       )}
                                     </div>
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-2 shrink-0">
                                       <button
                                         type="button"
                                         onClick={() => {
@@ -3033,7 +2856,7 @@ export default function App() {
                                 );
                               })}
 
-                              {/* Bottom infinite-scroll sentinel / load more trigger */}
+                              {/* Bottom load more trigger */}
                               <div className="pt-3 pb-1 text-center">
                                 {eventsLoadingMore ? (
                                   <span className="text-xs text-slate-400">
@@ -3060,6 +2883,221 @@ export default function App() {
                       )}
                     </>
                   ) : null}
+                </div>
+
+                {/* Right Column: Scrollable Camera List */}
+                <div className="lg:col-span-4 bg-white dark:bg-[#1a202c] border border-slate-200 dark:border-white/[0.06] rounded-2xl overflow-hidden min-w-0">
+                  <div className="px-4 py-3 border-b border-slate-200 dark:border-white/[0.06] flex items-center justify-between">
+                    <span className="text-xs font-semibold">
+                      Камеры ({placeVisibleCameras.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setSnapshotRefreshTick(Date.now())}
+                      title="Обновить снимки камер"
+                      className="p-1 rounded-lg text-slate-400 hover:text-[#2563EB] dark:hover:text-[#3B82F6] hover:bg-slate-100 dark:hover:bg-white/[0.05] transition-colors cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <div className="divide-y divide-slate-100 dark:divide-white/[0.06] max-h-[680px] overflow-y-auto overflow-x-hidden">
+                    {placeVisibleCameras.map((cam) => {
+                      const isSelected = activeVideoCamera?.id === cam.id;
+                      const lockForCam = getLinkedLockForCamera(cam);
+                      const isRenamingThis = renamingSidebarCameraId === cam.id;
+                      const isCustomRenamed = Boolean(
+                        cam.originalName && cam.originalName.trim() !== cam.name.trim()
+                      );
+
+                      return (
+                        <div
+                          key={cam.id}
+                          className={`p-3 transition-colors flex items-start gap-3 cursor-pointer ${
+                            isSelected
+                              ? 'bg-[#2563EB]/10 text-[#2563EB] dark:text-white'
+                              : 'hover:bg-slate-50 dark:hover:bg-white/[0.03]'
+                          }`}
+                          onClick={() => {
+                            if (isRenamingThis) return;
+                            if (activeVideoCamera?.id !== cam.id) {
+                              setSelectedVideoCameraId(cam.id);
+                              setArchiveDay(getRecentDays(1)[0]);
+                              setActiveEventId(null);
+                              setInitialClipSeekSec(0);
+                              setCameraEvents([]);
+                              setArchiveTimestampSec(null);
+                              setVideoPlaybackMode('live');
+                              setJumpTimeInput(
+                                formatUnixTime(Math.floor(Date.now() / 1000) - 300)
+                              );
+                            }
+                          }}
+                        >
+                          <ArchiveCameraThumb
+                            session={session}
+                            camera={cam}
+                            refreshTick={snapshotRefreshTick}
+                          />
+
+                          {isRenamingThis && !isSubscriptionRestricted ? (
+                            <form
+                              onClick={(e) => e.stopPropagation()}
+                              onSubmit={async (e) => {
+                                e.preventDefault();
+                                if (renamingSidebarSaving) return;
+                                setRenamingSidebarSaving(true);
+                                try {
+                                  await handleRenameCamera(cam, renamingSidebarDraft);
+                                  setRenamingSidebarCameraId(null);
+                                } finally {
+                                  setRenamingSidebarSaving(false);
+                                }
+                              }}
+                              className="min-w-0 flex-1 flex items-center gap-1"
+                            >
+                              <input
+                                type="text"
+                                value={renamingSidebarDraft}
+                                onChange={(e) => setRenamingSidebarDraft(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Escape') {
+                                    setRenamingSidebarCameraId(null);
+                                  }
+                                }}
+                                maxLength={80}
+                                autoFocus
+                                disabled={renamingSidebarSaving}
+                                placeholder={cam.originalName || 'Название камеры'}
+                                className="flex-1 min-w-0 px-2 py-1 text-xs font-semibold bg-white dark:bg-[#12161f] border border-[#2563EB]/60 rounded-lg text-slate-900 dark:text-white focus:outline-none"
+                              />
+                              <button
+                                type="submit"
+                                disabled={renamingSidebarSaving}
+                                title="Сохранить"
+                                className="p-1.5 rounded-lg bg-[#2563EB] hover:bg-blue-700 text-white shrink-0 cursor-pointer"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              {isCustomRenamed && (
+                                <button
+                                  type="button"
+                                  disabled={renamingSidebarSaving}
+                                  onClick={async () => {
+                                    setRenamingSidebarSaving(true);
+                                    try {
+                                      await handleRenameCamera(cam, '');
+                                      setRenamingSidebarCameraId(null);
+                                    } finally {
+                                      setRenamingSidebarSaving(false);
+                                    }
+                                  }}
+                                  title={`Сбросить на «${cam.originalName}»`}
+                                  className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.12] text-slate-600 dark:text-slate-300 shrink-0 cursor-pointer"
+                                >
+                                  <RotateCcw className="w-3 h-3" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                disabled={renamingSidebarSaving}
+                                onClick={() => setRenamingSidebarCameraId(null)}
+                                title="Отмена"
+                                className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.12] text-slate-500 dark:text-slate-400 shrink-0 cursor-pointer"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </form>
+                          ) : (
+                            <div className="min-w-0 flex-1 space-y-1.5">
+                              <div className="space-y-0.5">
+                                <div
+                                  className="text-xs font-semibold leading-snug break-words"
+                                  title={
+                                    isCustomRenamed
+                                      ? `${cam.name} (Исходное: ${cam.originalName})`
+                                      : cam.name
+                                  }
+                                >
+                                  {cam.name}
+                                </div>
+                                <div className="text-[11px] text-slate-400 font-mono tabular-nums leading-snug break-words">
+                                  {isCustomRenamed
+                                    ? `Исходное: ${cam.originalName}`
+                                    : `Архив ${cam.retentionDays} дн.`}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-end gap-1 flex-wrap">
+                                {!isSubscriptionRestricted && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setRenamingSidebarCameraId(cam.id);
+                                      setRenamingSidebarDraft(cam.name);
+                                    }}
+                                    title="Переименовать камеру"
+                                    className="p-1 rounded-lg text-slate-400 hover:text-[#2563EB] dark:hover:text-[#3B82F6] hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer"
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleToggleCameraFavorite(cam);
+                                  }}
+                                  title={
+                                    cam.favorite
+                                      ? 'Убрать из избранного'
+                                      : 'Добавить в избранное'
+                                  }
+                                  className={`p-1 rounded-lg transition-colors cursor-pointer ${
+                                    cam.favorite
+                                      ? 'text-amber-400 hover:bg-amber-500/10'
+                                      : 'text-slate-400 hover:text-amber-400 hover:bg-slate-100 dark:hover:bg-white/[0.06]'
+                                  }`}
+                                >
+                                  <Star
+                                    className={`w-3.5 h-3.5 ${
+                                      cam.favorite ? 'fill-amber-400 text-amber-400' : ''
+                                    }`}
+                                  />
+                                </button>
+
+                                {lockForCam && canOpenLock(lockForCam) && (
+                                  <button
+                                    type="button"
+                                    disabled={Boolean(unlockingMap[lockForCam.id])}
+                                    title={`Открыть: ${lockForCam.name}`}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleOpenLock(lockForCam);
+                                    }}
+                                    className={`px-2.5 py-1 text-xs font-semibold rounded-lg border transition-all whitespace-nowrap shrink-0 active:scale-[0.97] ${
+                                      unlockedMap[lockForCam.id]
+                                        ? 'bg-emerald-600 border-emerald-600 text-white cursor-pointer'
+                                        : unlockingMap[lockForCam.id]
+                                        ? 'bg-slate-200 dark:bg-white/10 border-slate-300 dark:border-white/10 text-slate-500 cursor-wait'
+                                        : 'bg-slate-100 dark:bg-slate-800 border-slate-200/90 dark:border-white/10 text-slate-800 dark:text-slate-200 hover:bg-[#2563EB] hover:border-[#2563EB] hover:text-white dark:hover:bg-[#2563EB] dark:hover:border-[#2563EB] dark:hover:text-white hover:shadow-sm cursor-pointer'
+                                    }`}
+                                  >
+                                    {unlockingMap[lockForCam.id]
+                                      ? 'Открытие...'
+                                      : unlockedMap[lockForCam.id]
+                                      ? 'Открыто'
+                                      : 'Открыть'}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
             </div>

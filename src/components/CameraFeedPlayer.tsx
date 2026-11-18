@@ -2,12 +2,18 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import mpegts from 'mpegts.js';
 import {
   Camera as CameraIcon,
+  Calendar,
   Copy,
   Check,
   Download,
+  KeyRound,
+  Lock,
   Maximize2,
   Minimize2,
   RefreshCw,
+  SkipBack,
+  SkipForward,
+  Unlock,
   Volume2,
   VolumeX,
   AlertCircle,
@@ -16,8 +22,9 @@ import {
   Info,
   Gauge,
 } from 'lucide-react';
-import { CameraItem, EgSession } from '../types/eg';
+import { CameraEventItem, CameraItem, EgSession, LockItem } from '../types/eg';
 import {
+  apiGetCameraEvents,
   apiGetCameraStream,
   buildEventClipUrl,
   buildSnapshotUrl,
@@ -44,6 +51,16 @@ interface CameraFeedPlayerProps {
   seekNonce?: number;
   nearestEventInfo?: { id: string; timestamp: number } | null;
   doorUnlockedPulse?: boolean;
+  linkedLock?: LockItem | null;
+  canOpenLock?: boolean;
+  isUnlocking?: boolean;
+  canViewArchive?: boolean;
+  events?: CameraEventItem[];
+  availableDays?: string[];
+  onOpenLock?: (lock: LockItem) => Promise<void> | void;
+  onSwitchToLive?: () => void;
+  onChangeArchiveDay?: (dayStr: string) => void;
+  onOpenEvent?: (ev: CameraEventItem) => void;
   onCaptureNotice?: (msg: string) => void;
   onSeekArchiveTimestamp?: (newTimestampSec: number) => void;
   onDiscoverMinAvailableTs?: (cameraId: string, minTs: number, label?: string) => void;
@@ -53,6 +70,22 @@ interface CameraFeedPlayerProps {
 }
 
 const SPEED_OPTIONS = [0.5, 1, 1.25, 1.5, 2, 4] as const;
+const TIMELINE_SPAN_SEC = 5400; // 90 minutes visible window (±45m around playhead)
+const WEEKDAYS_RU = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'] as const;
+const MONTHS_SHORT_RU = [
+  'янв.',
+  'фев.',
+  'мар.',
+  'апр.',
+  'мая',
+  'июн.',
+  'июл.',
+  'авг.',
+  'сен.',
+  'окт.',
+  'нояб.',
+  'дек.',
+] as const;
 
 function formatClockHMS(unixSec: number): string {
   const d = new Date(unixSec * 1000);
@@ -60,12 +93,34 @@ function formatClockHMS(unixSec: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function formatClipTime(sec: number): string {
-  if (!Number.isFinite(sec) || sec < 0) return '00:00';
-  const total = Math.floor(sec);
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+function formatClockHM(unixSec: number): string {
+  const d = new Date(unixSec * 1000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function findBestEventNearTs(
+  targetTs: number,
+  pool: CameraEventItem[],
+  maxDiffSec = 120
+): CameraEventItem | null {
+  if (!pool || pool.length === 0) return null;
+  let best: CameraEventItem | null = null;
+  let bestDiff = Infinity;
+  for (const ev of pool) {
+    const endTs = ev.timestamp + Math.max(20, ev.duration || 30);
+    if (targetTs >= ev.timestamp - 5 && targetTs <= endTs + 5) {
+      return ev;
+    }
+    if (maxDiffSec > 0) {
+      const diff = Math.abs(ev.timestamp - targetTs);
+      if (diff <= maxDiffSec && diff < bestDiff) {
+        best = ev;
+        bestDiff = diff;
+      }
+    }
+  }
+  return best;
 }
 
 function formatLocalIsoDateFromUnix(unixSec: number): string {
@@ -74,6 +129,34 @@ function formatLocalIsoDateFromUnix(unixSec: number): string {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+function buildRecentDaysList(days: number): string[] {
+  const list: string[] = [];
+  const base = new Date();
+  for (let i = 0; i < days; i++) {
+    const d = new Date(base.getTime() - i * 86400 * 1000);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    list.push(`${y}-${m}-${day}`);
+  }
+  return list;
+}
+
+function formatWeekdayDayBadge(isoDay: string): string {
+  const dt = new Date(`${isoDay}T12:00:00`);
+  if (Number.isNaN(dt.getTime())) return isoDay;
+  return `${WEEKDAYS_RU[dt.getDay()]}, ${dt.getDate()}`;
+}
+
+function formatDayOptionLabel(isoDay: string, index: number): string {
+  const dt = new Date(`${isoDay}T12:00:00`);
+  if (Number.isNaN(dt.getTime())) return isoDay;
+  const base = `${WEEKDAYS_RU[dt.getDay()]}, ${dt.getDate()} ${MONTHS_SHORT_RU[dt.getMonth()]}`;
+  if (index === 0) return `Сегодня · ${base}`;
+  if (index === 1) return `Вчера · ${base}`;
+  return base;
 }
 
 export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
@@ -90,6 +173,16 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
   seekNonce = 0,
   nearestEventInfo = null,
   doorUnlockedPulse = false,
+  linkedLock = null,
+  canOpenLock = false,
+  isUnlocking = false,
+  canViewArchive = true,
+  events: eventsProp,
+  availableDays,
+  onOpenLock,
+  onSwitchToLive,
+  onChangeArchiveDay,
+  onOpenEvent,
   onCaptureNotice,
   onSeekArchiveTimestamp,
   onDiscoverMinAvailableTs,
@@ -104,8 +197,17 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
   const hideHudTimerRef = useRef<number | null>(null);
   const hudBarHoverRef = useRef<boolean>(false);
   const autoDvrFallbackKeyRef = useRef<string | null>(null);
+  const autoMinSeekKeyRef = useRef<string | null>(null);
   const speedMenuRef = useRef<HTMLDivElement | null>(null);
   const infoMenuRef = useRef<HTMLDivElement | null>(null);
+  const dateMenuRef = useRef<HTMLDivElement | null>(null);
+  const rulerRef = useRef<HTMLDivElement | null>(null);
+  const dragStateRef = useRef<{
+    startX: number;
+    startCenterTs: number;
+    rulerWidth: number;
+    hasDragged: boolean;
+  } | null>(null);
   const suppressNextVideoClickRef = useRef<boolean>(false);
 
   const [loading, setLoading] = useState<boolean>(false);
@@ -113,6 +215,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
   const [errorMinTs, setErrorMinTs] = useState<number | null>(null);
   const [discoveredMinTs, setDiscoveredMinTs] = useState<number | null>(knownMinAvailableTs);
   const [upstreamUrl, setUpstreamUrl] = useState<string | null>(null);
+  const [internalEvents, setInternalEvents] = useState<CameraEventItem[]>([]);
 
   // Audio enabled by default at 100% (0..100% range)
   const [muted, setMuted] = useState<boolean>(false);
@@ -128,17 +231,20 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
   // Playback speed, pause, clip progress & fullscreen
   const [playbackRate, setPlaybackRate] = useState<number>(1);
   const [isPaused, setIsPaused] = useState<boolean>(false);
-  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState<boolean>(false);
+  const [isPseudoFullscreen, setIsPseudoFullscreen] = useState<boolean>(false);
+  const isFullscreen = isNativeFullscreen || isPseudoFullscreen;
   const [clipCurrentTime, setClipCurrentTime] = useState<number>(0);
   const [clipDuration, setClipDuration] = useState<number>(0);
 
-  // Archive DVR elapsed clock & scrub target
+  // Live clock + Archive DVR elapsed clock & scrub target
+  const [liveNowSec, setLiveNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
   const [streamElapsedSec, setStreamElapsedSec] = useState<number>(0);
   const [scrubPreviewTs, setScrubPreviewTs] = useState<number | null>(null);
 
-  // YouTube-style overlay visibility & popovers ('speed' | 'info' | null)
+  // Floating HUD visibility & popovers ('speed' | 'info' | 'date' | null)
   const [hudActive, setHudActive] = useState<boolean>(true);
-  const [activePopover, setActivePopover] = useState<'speed' | 'info' | null>(null);
+  const [activePopover, setActivePopover] = useState<'speed' | 'info' | 'date' | null>(null);
   const [popoverAlign, setPopoverAlign] = useState<'left' | 'right'>('right');
 
   const [downloadingMp4, setDownloadingMp4] = useState<boolean>(false);
@@ -148,8 +254,17 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
   const effectiveMinAvailableTs = discoveredMinTs ?? knownMinAvailableTs ?? null;
 
   useEffect(() => {
+    const timer = window.setInterval(() => {
+      setLiveNowSec(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     setDiscoveredMinTs(knownMinAvailableTs ?? null);
     setErrorMinTs(null);
+    autoMinSeekKeyRef.current = null;
+    setInternalEvents([]);
   }, [camera.id]);
 
   useEffect(() => {
@@ -160,13 +275,13 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
 
   useEffect(() => {
     const onFsChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
+      setIsNativeFullscreen(Boolean(document.fullscreenElement));
     };
     document.addEventListener('fullscreenchange', onFsChange);
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
 
-  // Auto-hide HUD after 2.8s of cursor inactivity while playing
+  // Auto-hide HUD after 3.2s of cursor inactivity while playing
   const triggerHudActivity = () => {
     setHudActive(true);
     if (hideHudTimerRef.current != null) {
@@ -176,7 +291,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
       if (!hudBarHoverRef.current) {
         setHudActive(false);
       }
-    }, 2800);
+    }, 3200);
   };
 
   useEffect(() => {
@@ -187,17 +302,21 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
     };
   }, []);
 
-  // Close speed/info popover when clicking anywhere outside or pressing Escape
+  // Close speed/info/date popover when clicking anywhere outside or pressing Escape
   useEffect(() => {
-    if (!activePopover) return;
+    if (!activePopover && !isPseudoFullscreen) return;
     const onPointerDown = (e: PointerEvent) => {
+      if (!activePopover) return;
       const target = e.target as Node | null;
       const activeWrapper =
-        activePopover === 'speed' ? speedMenuRef.current : infoMenuRef.current;
+        activePopover === 'speed'
+          ? speedMenuRef.current
+          : activePopover === 'date'
+            ? dateMenuRef.current
+            : infoMenuRef.current;
       if (activeWrapper && target && activeWrapper.contains(target)) {
         return;
       }
-      // If user clicked directly on the video element to dismiss the menu, don't toggle play/pause
       if (videoRef.current && target && videoRef.current.contains(target)) {
         suppressNextVideoClickRef.current = true;
         window.setTimeout(() => {
@@ -208,7 +327,11 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setActivePopover(null);
+        if (activePopover) {
+          setActivePopover(null);
+        } else if (isPseudoFullscreen) {
+          setIsPseudoFullscreen(false);
+        }
       }
     };
     document.addEventListener('pointerdown', onPointerDown, true);
@@ -217,7 +340,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
       document.removeEventListener('pointerdown', onPointerDown, true);
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [activePopover]);
+  }, [activePopover, isPseudoFullscreen]);
 
   const showControls =
     hudActive ||
@@ -484,11 +607,38 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
             if (
               playbackMode === 'archive_stream' &&
               archiveTimestampSec != null &&
-              archiveTimestampSec < minTs &&
-              onRequestFallbackEventMp4?.(archiveTimestampSec)
+              archiveTimestampSec < minTs
             ) {
-              setLoading(false);
-              return;
+              if (onRequestFallbackEventMp4?.(archiveTimestampSec)) {
+                setLoading(false);
+                return;
+              }
+              const nearbyEvent = findBestEventNearTs(archiveTimestampSec, effectiveEvents, 120);
+              if (nearbyEvent && onOpenEvent) {
+                onCaptureNotice?.(
+                  `Открыта запись события (${formatClockHMS(nearbyEvent.timestamp)})`
+                );
+                onOpenEvent(nearbyEvent);
+                setLoading(false);
+                return;
+              }
+              const nowGuard = Math.floor(Date.now() / 1000) - 4;
+              const autoSafeTs = Math.min(nowGuard, minTs + 6);
+              const autoKey = `${camera.id}:${archiveTimestampSec}`;
+              if (
+                onSeekArchiveTimestamp &&
+                archiveTimestampSec >= minTs - 600 &&
+                autoSafeTs > archiveTimestampSec + 3 &&
+                autoMinSeekKeyRef.current !== autoKey
+              ) {
+                autoMinSeekKeyRef.current = autoKey;
+                onCaptureNotice?.(
+                  `DVR-буфер камеры начинается с ${formatClockHMS(autoSafeTs)}`
+                );
+                onSeekArchiveTimestamp(autoSafeTs);
+                setLoading(false);
+                return;
+              }
             }
           }
           setError(
@@ -530,10 +680,16 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
     seekNonce,
   ]);
 
-  // Compute real-time clock bounds for archive_stream timeline scrubber
-  const nowLimitSec = Math.floor(Date.now() / 1000) - 5;
+  // Compute real-time clock bounds for interactive timeline scrubber
+  const nowLimitSec = Math.max(liveNowSec - 3, Math.floor(Date.now() / 1000) - 3);
+  const retentionDays = Math.max(1, Math.min(7, camera.retentionDays || 7));
+  const retentionMinSec = liveNowSec - retentionDays * 86400;
   const currentArchiveUnixSec =
-    (archiveTimestampSec || nowLimitSec - 600) + Math.floor(streamElapsedSec);
+    playbackMode === 'live'
+      ? liveNowSec
+      : playbackMode === 'event_mp4'
+        ? (archiveTimestampSec || liveNowSec - 300) + Math.floor(clipCurrentTime)
+        : (archiveTimestampSec || liveNowSec - 600) + Math.floor(streamElapsedSec);
 
   const sliderBounds = useMemo(() => {
     const dayStr =
@@ -557,21 +713,189 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
 
   const sliderDisplayTs =
     scrubPreviewTs !== null
-      ? Math.max(sliderBounds.minSec, Math.min(sliderBounds.maxSec, scrubPreviewTs))
-      : Math.max(sliderBounds.minSec, Math.min(sliderBounds.maxSec, currentArchiveUnixSec));
+      ? Math.max(retentionMinSec, Math.min(nowLimitSec, scrubPreviewTs))
+      : playbackMode === 'live'
+        ? liveNowSec
+        : Math.max(retentionMinSec, Math.min(nowLimitSec, currentArchiveUnixSec));
+
+  const displayDayIso = useMemo(() => {
+    if (playbackMode === 'live' && scrubPreviewTs === null) {
+      return formatLocalIsoDateFromUnix(liveNowSec);
+    }
+    return archiveDay || formatLocalIsoDateFromUnix(sliderDisplayTs);
+  }, [playbackMode, scrubPreviewTs, liveNowSec, archiveDay, sliderDisplayTs]);
+
+  // Load camera motion events automatically if caller (e.g. OverviewDashboard) didn't pass events
+  useEffect(() => {
+    if (eventsProp !== undefined || !canViewArchive) return;
+    let cancelled = false;
+    apiGetCameraEvents(session, camera.id, camera.placeId, displayDayIso, { count: 100 })
+      .then((page) => {
+        if (!cancelled) {
+          setInternalEvents(page.events || []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setInternalEvents([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [eventsProp, canViewArchive, session, camera.id, camera.placeId, displayDayIso]);
+
+  const effectiveEvents = eventsProp ?? internalEvents;
+
+  const effectiveNearestEvent = useMemo(() => {
+    if (nearestEventInfo) return nearestEventInfo;
+    if (effectiveEvents.length === 0) return null;
+    const refTs = archiveTimestampSec ?? liveNowSec;
+    let best = effectiveEvents[0];
+    let bestDiff = Math.abs(best.timestamp - refTs);
+    for (const ev of effectiveEvents) {
+      const diff = Math.abs(ev.timestamp - refTs);
+      if (diff < bestDiff) {
+        best = ev;
+        bestDiff = diff;
+      }
+    }
+    return best;
+  }, [nearestEventInfo, effectiveEvents, archiveTimestampSec, liveNowSec]);
+
+  const retentionDaysList = useMemo(() => {
+    if (availableDays && availableDays.length > 0) return availableDays;
+    return buildRecentDaysList(retentionDays);
+  }, [availableDays, retentionDays]);
 
   const commitArchiveScrub = (rawTargetTs: number | null) => {
     if (rawTargetTs === null) return;
     const clamped = Math.max(
-      sliderBounds.minSec,
-      Math.min(sliderBounds.maxSec, Math.floor(rawTargetTs))
+      retentionMinSec,
+      Math.min(nowLimitSec, Math.floor(rawTargetTs))
     );
     setScrubPreviewTs(null);
+    if (clamped >= nowLimitSec - 8 && onSwitchToLive) {
+      onSwitchToLive();
+      return;
+    }
+    if (!canViewArchive) {
+      onCaptureNotice?.('Архив недоступен для этой камеры на текущем тарифе');
+      return;
+    }
+    if (effectiveMinAvailableTs != null && clamped < effectiveMinAvailableTs) {
+      const nearby = findBestEventNearTs(clamped, effectiveEvents, 120);
+      if (nearby && onOpenEvent) {
+        onOpenEvent(nearby);
+        return;
+      }
+      if (clamped >= effectiveMinAvailableTs - 120) {
+        const safeTarget = Math.min(nowLimitSec - 4, effectiveMinAvailableTs + 6);
+        onSeekArchiveTimestamp?.(safeTarget);
+        return;
+      }
+    }
     onSeekArchiveTimestamp?.(clamped);
   };
 
+  const handleStepPrev = () => {
+    triggerHudActivity();
+    if (!canViewArchive) {
+      onCaptureNotice?.('Архив недоступен на текущем тарифе');
+      return;
+    }
+    const curTs =
+      playbackMode === 'live'
+        ? liveNowSec
+        : playbackMode === 'event_mp4'
+          ? archiveTimestampSec || liveNowSec - 300
+          : currentArchiveUnixSec;
+
+    if (effectiveEvents.length > 0) {
+      const sortedDesc = [...effectiveEvents].sort((a, b) => b.timestamp - a.timestamp);
+      const prevEv = sortedDesc.find((ev) => ev.timestamp < curTs - 5);
+      if (prevEv) {
+        if (onOpenEvent) {
+          onOpenEvent(prevEv);
+        } else {
+          onSeekArchiveTimestamp?.(prevEv.timestamp);
+        }
+        return;
+      }
+    }
+
+    const stepTarget = Math.max(retentionMinSec, curTs - 60);
+    commitArchiveScrub(stepTarget);
+  };
+
+  const handleStepNext = () => {
+    triggerHudActivity();
+    if (playbackMode === 'live' || !canViewArchive) return;
+    const curTs =
+      playbackMode === 'event_mp4'
+        ? archiveTimestampSec || liveNowSec - 300
+        : currentArchiveUnixSec;
+
+    if (effectiveEvents.length > 0) {
+      const sortedAsc = [...effectiveEvents].sort((a, b) => a.timestamp - b.timestamp);
+      const nextEv = sortedAsc.find((ev) => ev.timestamp > curTs + 5);
+      if (nextEv) {
+        if (onOpenEvent) {
+          onOpenEvent(nextEv);
+        } else {
+          onSeekArchiveTimestamp?.(nextEv.timestamp);
+        }
+        return;
+      }
+    }
+
+    const stepTarget = curTs + 60;
+    if (stepTarget >= nowLimitSec - 8 && onSwitchToLive) {
+      onSwitchToLive();
+      return;
+    }
+    commitArchiveScrub(stepTarget);
+  };
+
+  // Interactive tick marks generated around current center timestamp
+  const rulerTicks = useMemo(() => {
+    const halfSpan = TIMELINE_SPAN_SEC / 2;
+    const minVisible = sliderDisplayTs - halfSpan;
+    const maxVisible = sliderDisplayTs + halfSpan;
+    const firstTick = Math.ceil(minVisible / 120) * 120; // every 2 minutes
+    const ticks: Array<{
+      ts: number;
+      pct: number;
+      kind: 'major' | 'medium' | 'minor';
+      label?: string;
+      isFuture: boolean;
+      hasEvent: boolean;
+    }> = [];
+
+    for (let ts = firstTick; ts <= maxVisible; ts += 120) {
+      const d = new Date(ts * 1000);
+      const mins = d.getMinutes();
+      const kind: 'major' | 'medium' | 'minor' =
+        mins === 0 || mins === 30 ? 'major' : mins % 10 === 0 ? 'medium' : 'minor';
+      const pct = ((ts - minVisible) / TIMELINE_SPAN_SEC) * 100;
+      const hasEvent = effectiveEvents.some((ev) => Math.abs(ev.timestamp - ts) <= 90);
+      ticks.push({
+        ts,
+        pct,
+        kind,
+        label: kind === 'major' ? formatClockHM(ts) : undefined,
+        isFuture: ts > liveNowSec,
+        hasEvent,
+      });
+    }
+    return ticks;
+  }, [sliderDisplayTs, liveNowSec, effectiveEvents]);
+
+  const canArchiveInteractive =
+    canViewArchive && Boolean(onSeekArchiveTimestamp || onOpenEvent);
+
   const handleTogglePopover = (
-    kind: 'speed' | 'info',
+    kind: 'speed' | 'info' | 'date',
     wrapperEl: HTMLDivElement | null
   ) => {
     triggerHudActivity();
@@ -630,51 +954,6 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
       videoRef.current.pause();
       setIsPaused(true);
     }
-  };
-
-  const handleStepArchiveOrClip = (deltaSec: number) => {
-    triggerHudActivity();
-    if (playbackMode === 'event_mp4' && videoRef.current) {
-      const dur = Number.isFinite(videoRef.current.duration)
-        ? videoRef.current.duration
-        : activeEventDurationSec || 20;
-      const nextTime = Math.max(0, Math.min(dur, videoRef.current.currentTime + deltaSec));
-      videoRef.current.currentTime = nextTime;
-      setClipCurrentTime(nextTime);
-      return;
-    }
-
-    if (
-      playbackMode === 'archive_stream' &&
-      videoRef.current &&
-      videoRef.current.buffered.length > 0
-    ) {
-      const targetElTime = videoRef.current.currentTime + deltaSec;
-      const bufStart = videoRef.current.buffered.start(0);
-      const bufEnd = videoRef.current.buffered.end(videoRef.current.buffered.length - 1);
-      if (targetElTime >= bufStart && targetElTime <= bufEnd - 0.5) {
-        videoRef.current.currentTime = targetElTime;
-        setStreamElapsedSec(Math.floor(targetElTime));
-        return;
-      }
-    }
-
-    const baseTs =
-      (archiveTimestampSec || Math.floor(Date.now() / 1000) - 600) +
-      Math.floor(streamElapsedSec);
-    let nextTs = Math.min(Math.floor(Date.now() / 1000) - 5, baseTs + deltaSec);
-
-    if (effectiveMinAvailableTs != null && nextTs < effectiveMinAvailableTs) {
-      if (onRequestFallbackEventMp4?.(nextTs)) {
-        return;
-      }
-      nextTs = effectiveMinAvailableTs;
-      onCaptureNotice?.(
-        `Начало DVR-буфера камеры: ${formatClockHMS(effectiveMinAvailableTs)}. Более ранние моменты доступны через «Смотреть» в списке событий.`
-      );
-    }
-
-    onSeekArchiveTimestamp?.(nextTs);
   };
 
   const handleDownloadVideo = async () => {
@@ -750,11 +1029,21 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
 
   const handleFullscreen = () => {
     triggerHudActivity();
+    if (isPseudoFullscreen) {
+      setIsPseudoFullscreen(false);
+      return;
+    }
     if (!containerRef.current) return;
     if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {});
+      document.exitFullscreen().catch(() => {
+        setIsPseudoFullscreen(false);
+      });
+    } else if (typeof containerRef.current.requestFullscreen === 'function') {
+      containerRef.current.requestFullscreen().catch(() => {
+        setIsPseudoFullscreen(true);
+      });
     } else {
-      containerRef.current.requestFullscreen().catch(() => {});
+      setIsPseudoFullscreen(true);
     }
   };
 
@@ -776,22 +1065,6 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
         })
       : null;
 
-  const seekSteps =
-    playbackMode === 'event_mp4'
-      ? [
-          { delta: -15, label: '-15с' },
-          { delta: -5, label: '-5с' },
-          { delta: 5, label: '+5с' },
-          { delta: 15, label: '+15с' },
-        ]
-      : [
-          { delta: -300, label: '-5м' },
-          { delta: -60, label: '-1м' },
-          { delta: -15, label: '-15с' },
-          { delta: 15, label: '+15с' },
-          { delta: 60, label: '+1м' },
-        ];
-
   return (
     <div
       ref={containerRef}
@@ -804,7 +1077,11 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
         }
       }}
       onTouchStart={triggerHudActivity}
-      className="relative aspect-video w-full h-full bg-black overflow-hidden select-none"
+      className={
+        isPseudoFullscreen
+          ? 'fixed inset-0 z-[100] w-screen h-screen bg-black overflow-hidden select-none'
+          : 'relative aspect-video w-full h-full bg-black overflow-hidden select-none rounded-2xl'
+      }
     >
       {/* Video Layer */}
       {session.mode === 'demo' && playbackMode !== 'event_mp4' ? (
@@ -908,51 +1185,266 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
         />
       )}
 
-      {/* Top Subtle Overlay Header (Shown on Hover / Pause) */}
+      {/* Top Overlay Header: Left Audio/Tools, Center Open-Key Pill, Right Fullscreen */}
       <div
-        className={`absolute inset-x-0 top-0 px-4 pt-3 pb-8 bg-gradient-to-b from-black/75 via-black/35 to-transparent flex items-start justify-between gap-3 transition-opacity duration-200 pointer-events-none ${
+        onMouseEnter={() => {
+          hudBarHoverRef.current = true;
+          setHudActive(true);
+        }}
+        onMouseLeave={() => {
+          hudBarHoverRef.current = false;
+        }}
+        onClick={(e) => e.stopPropagation()}
+        className={`absolute inset-x-0 top-0 px-2.5 sm:px-4 pt-2.5 sm:pt-3 pb-10 bg-gradient-to-b from-black/75 via-black/30 to-transparent flex items-center justify-between gap-2 transition-opacity duration-200 z-20 pointer-events-none ${
           showControls ? 'opacity-100' : 'opacity-0'
         }`}
       >
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs font-semibold text-white truncate drop-shadow-sm">
-            {camera.name}
-          </span>
-          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-black/55 backdrop-blur-sm text-[11px] font-mono text-white/90 shrink-0">
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                playbackMode === 'live' ? 'bg-emerald-400' : 'bg-[#3B82F6]'
+        {/* Top-Left Compact Utility Pill (Volume, Speed, Download, Screenshot, Info) */}
+        <div className="pointer-events-auto flex items-center gap-0.5 sm:gap-1 px-1.5 sm:px-2 py-1 rounded-full bg-slate-950/80 border border-white/15 backdrop-blur-md text-white shadow-lg">
+          <button
+            type="button"
+            onClick={() => {
+              const nextMuted = !muted;
+              setMuted(nextMuted);
+              audioEngineRef.current?.setMuted(nextMuted);
+            }}
+            className="p-1.5 rounded-full hover:bg-white/10 transition-colors cursor-pointer"
+            title={muted ? 'Включить звук' : 'Выключить звук'}
+          >
+            {muted || volume === 0 ? (
+              <VolumeX className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#3B82F6]" />
+            ) : (
+              <Volume2 className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-white" />
+            )}
+          </button>
+
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={muted ? 0 : Math.min(1, volume)}
+            onChange={(e) => {
+              const v = Math.max(0, Math.min(1, parseFloat(e.target.value)));
+              setVolume(v);
+              if (v > 0 && muted) {
+                setMuted(false);
+              }
+            }}
+            aria-label="Громкость звука"
+            className="hidden sm:block w-14 accent-[#3B82F6] cursor-pointer h-1 bg-white/30 rounded-full"
+          />
+
+          {!muted && audioStatus.contextState === 'suspended' && playbackMode !== 'event_mp4' && (
+            <button
+              type="button"
+              onClick={() => audioEngineRef.current?.resumeContext()}
+              className="px-2 py-0.5 rounded-full bg-[#2563EB] hover:bg-blue-700 text-[10px] font-semibold text-white cursor-pointer whitespace-nowrap"
+            >
+              Звук
+            </button>
+          )}
+
+          {playbackMode !== 'live' && (
+            <div ref={speedMenuRef} className="relative">
+              <button
+                type="button"
+                onClick={() => handleTogglePopover('speed', speedMenuRef.current)}
+                className={`inline-flex items-center gap-1 px-1.5 sm:px-2 py-1 rounded-full text-[11px] font-mono font-semibold transition-colors cursor-pointer ${
+                  activePopover === 'speed' || playbackRate !== 1
+                    ? 'bg-[#2563EB] text-white'
+                    : 'hover:bg-white/15 text-white/90'
+                }`}
+                title="Скорость воспроизведения"
+              >
+                <Gauge className="w-3.5 h-3.5" />
+                <span>{playbackRate}x</span>
+              </button>
+
+              {activePopover === 'speed' && (
+                <div className="absolute top-full left-0 mt-2 w-44 rounded-2xl bg-slate-950/95 backdrop-blur-md border border-white/15 p-1.5 shadow-2xl z-30">
+                  <div className="px-2.5 py-1 text-[11px] font-semibold text-white/60 border-b border-white/10 mb-1">
+                    Скорость воспроизведения
+                  </div>
+                  {SPEED_OPTIONS.map((spd) => {
+                    const selected = playbackRate === spd;
+                    return (
+                      <button
+                        key={spd}
+                        type="button"
+                        onClick={() => {
+                          setPlaybackRate(spd);
+                          if (videoRef.current) {
+                            try {
+                              videoRef.current.playbackRate = spd;
+                            } catch {
+                              // ignore
+                            }
+                          }
+                          setActivePopover(null);
+                        }}
+                        className={`w-full px-2.5 py-1.5 rounded-xl text-xs font-mono flex items-center justify-between transition-colors cursor-pointer ${
+                          selected
+                            ? 'bg-[#2563EB] text-white font-semibold'
+                            : 'text-white/90 hover:bg-white/10'
+                        }`}
+                      >
+                        <span>{spd === 1 ? 'Обычная (1x)' : `${spd}x`}</span>
+                        {selected && <Check className="w-3.5 h-3.5" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={handleCaptureFrame}
+            className="p-1.5 rounded-full hover:bg-white/15 text-white/90 transition-colors cursor-pointer"
+            title="Сделать скриншот кадра"
+          >
+            <CameraIcon className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+          </button>
+
+          {playbackMode !== 'live' && canViewArchive && (
+            <button
+              type="button"
+              onClick={handleDownloadVideo}
+              disabled={downloadingMp4}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-[#2563EB] hover:bg-blue-700 disabled:opacity-60 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+              title="Скачать фрагмент MP4"
+            >
+              {downloadingMp4 ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              <span className="hidden md:inline">MP4</span>
+            </button>
+          )}
+
+          <div ref={infoMenuRef} className="relative">
+            <button
+              type="button"
+              onClick={() => handleTogglePopover('info', infoMenuRef.current)}
+              className={`p-1.5 rounded-full transition-colors cursor-pointer ${
+                activePopover === 'info'
+                  ? 'bg-white/25 text-white'
+                  : 'hover:bg-white/15 text-white/90'
               }`}
-            />
-            {playbackMode === 'live'
-              ? 'Прямой эфир'
-              : playbackMode === 'event_mp4' && archiveTimestampSec
-              ? `Событие ${formatClockHMS(archiveTimestampSec)}`
-              : `Архив ${formatClockHMS(sliderDisplayTs)}`}
+              title="Сведения о потоке и переподключение"
+            >
+              <Info className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+            </button>
+
+            {activePopover === 'info' && (
+              <div
+                className={`absolute top-full mt-2 ${
+                  popoverAlign === 'left' ? 'left-0' : 'right-0'
+                } w-72 max-w-[85vw] rounded-2xl bg-slate-950/95 backdrop-blur-md border border-white/15 p-3.5 shadow-2xl text-xs text-white/90 space-y-2 z-30`}
+              >
+                <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                  <span className="font-semibold text-white">Сведения о видео</span>
+                  <span className="font-mono text-[11px] text-white/60">ID {camera.id}</span>
+                </div>
+                <div className="space-y-1 text-[11px]">
+                  <div className="flex justify-between gap-2">
+                    <span className="text-white/60">Камера:</span>
+                    <span className="text-right font-medium truncate">{camera.name}</span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-white/60">Режим:</span>
+                    <span className="text-right">
+                      {playbackMode === 'live'
+                        ? 'Прямой эфир (FLV)'
+                        : playbackMode === 'event_mp4'
+                        ? 'Событие архива (MP4)'
+                        : 'Непрерывный DVR-поток'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-white/60">Поток / звук:</span>
+                    <span className="text-right font-mono">{audioStatus.codecLabel}</span>
+                  </div>
+                  {playbackMode === 'archive_stream' && sliderBounds.hasDvrFloor && (
+                    <div className="flex justify-between gap-2">
+                      <span className="text-white/60">DVR-буфер с:</span>
+                      <span className="text-right font-mono text-amber-300">
+                        {formatClockHMS(sliderBounds.minSec)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <div className="pt-1.5 border-t border-white/10 flex items-center gap-2">
+                  {upstreamUrl && playbackMode !== 'event_mp4' && (
+                    <button
+                      type="button"
+                      onClick={handleCopyStreamUrl}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-[11px] font-medium transition-colors cursor-pointer"
+                    >
+                      {copiedUrl ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Скопировано</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>URL потока</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActivePopover(null);
+                      setReloadNonce((n) => n + 1);
+                    }}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-[11px] font-medium transition-colors cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Переподключить</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Top-Center Brand & Camera Pill (Open-Key style) */}
+        <div className="hidden sm:inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-950/80 border border-white/15 backdrop-blur-md shadow-lg max-w-[45%]">
+          <span className="w-5 h-5 rounded-full bg-[#2563EB] flex items-center justify-center text-white shrink-0">
+            <KeyRound className="w-3 h-3" />
           </span>
+          <span className="text-xs font-semibold text-white truncate">{camera.name}</span>
           {playbackMode !== 'live' && playbackRate !== 1 && (
-            <span className="px-1.5 py-0.5 rounded bg-[#2563EB] text-white text-[10px] font-mono font-bold">
+            <span className="px-1.5 py-0.5 rounded-full bg-[#2563EB] text-white text-[10px] font-mono font-bold shrink-0">
               {playbackRate}x
             </span>
           )}
         </div>
 
-        {/* Audio Autoplay Suspended Prompt */}
-        {!muted && audioStatus.contextState === 'suspended' && playbackMode !== 'event_mp4' && (
-          <button
-            type="button"
-            onClick={() => audioEngineRef.current?.resumeContext()}
-            className="pointer-events-auto px-3 py-1.5 rounded-lg bg-[#2563EB] hover:bg-blue-700 text-white font-semibold text-xs shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer"
-          >
-            <Volume2 className="w-3.5 h-3.5" />
-            <span>Включить звук</span>
-          </button>
-        )}
+        {/* Top-Right Fullscreen / Collapse Button */}
+        <button
+          type="button"
+          onClick={handleFullscreen}
+          className="pointer-events-auto w-8 h-8 sm:w-9 sm:h-9 rounded-full bg-slate-950/80 hover:bg-slate-900 border border-white/15 backdrop-blur-md text-white flex items-center justify-center shadow-lg transition-colors cursor-pointer shrink-0"
+          title={isFullscreen ? 'Свернуть' : 'На весь экран'}
+        >
+          {isFullscreen ? (
+            <Minimize2 className="w-4 h-4" />
+          ) : (
+            <Maximize2 className="w-4 h-4" />
+          )}
+        </button>
       </div>
 
       {/* Loading Overlay */}
       {loading && (
-        <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2.5 text-white pointer-events-none">
+        <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2.5 text-white pointer-events-none z-10">
           <RefreshCw className="w-6 h-6 animate-spin text-[#3B82F6]" />
           <span className="text-xs font-mono text-white/90">
             {playbackMode === 'event_mp4'
@@ -964,7 +1456,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
 
       {/* Error Overlay */}
       {error && session.mode === 'live' && (
-        <div className="absolute inset-x-4 top-14 bg-black/90 backdrop-blur-md border border-rose-500/50 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3 z-20">
+        <div className="absolute inset-x-3 sm:inset-x-4 top-14 bg-slate-950/92 backdrop-blur-md border border-rose-500/50 rounded-2xl p-3 flex flex-wrap items-center justify-between gap-3 z-30">
           <div className="flex items-center gap-2.5 text-xs text-white/90">
             <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
             <span>{error}</span>
@@ -979,7 +1471,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
                     setError(null);
                     onSwitchToDvrStream();
                   }}
-                  className="px-3 py-1.5 text-xs font-semibold bg-[#2563EB] hover:bg-blue-700 text-white rounded-lg whitespace-nowrap transition-colors cursor-pointer"
+                  className="px-3 py-1.5 text-xs font-semibold bg-[#2563EB] hover:bg-blue-700 text-white rounded-xl whitespace-nowrap transition-colors cursor-pointer"
                 >
                   Поток DVR
                 </button>
@@ -989,31 +1481,36 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
                 type="button"
                 onClick={() => {
                   setError(null);
-                  onSeekArchiveTimestamp(errorMinTs);
+                  const safeTarget = Math.min(Math.floor(Date.now() / 1000) - 4, errorMinTs + 6);
+                  onSeekArchiveTimestamp(safeTarget);
                 }}
-                className="px-3 py-1.5 text-xs font-semibold bg-[#2563EB] hover:bg-blue-700 text-white rounded-lg whitespace-nowrap transition-colors cursor-pointer"
+                className="px-3 py-1.5 text-xs font-semibold bg-[#2563EB] hover:bg-blue-700 text-white rounded-xl whitespace-nowrap transition-colors cursor-pointer"
               >
                 Перейти к {formatClockHMS(errorMinTs)}
               </button>
             )}
             {playbackMode === 'archive_stream' &&
-              nearestEventInfo &&
-              onOpenNearestEvent && (
+              effectiveNearestEvent &&
+              (onOpenNearestEvent || onOpenEvent) && (
                 <button
                   type="button"
                   onClick={() => {
                     setError(null);
-                    onOpenNearestEvent();
+                    if (onOpenNearestEvent) {
+                      onOpenNearestEvent();
+                    } else if (onOpenEvent && 'id' in effectiveNearestEvent) {
+                      onOpenEvent(effectiveNearestEvent as CameraEventItem);
+                    }
                   }}
-                  className="px-3 py-1.5 text-xs font-semibold bg-[#2563EB] hover:bg-blue-700 text-white rounded-lg whitespace-nowrap transition-colors cursor-pointer"
+                  className="px-3 py-1.5 text-xs font-semibold bg-[#2563EB] hover:bg-blue-700 text-white rounded-xl whitespace-nowrap transition-colors cursor-pointer"
                 >
-                  Ближайшее событие ({formatClockHMS(nearestEventInfo.timestamp)})
+                  Ближайшее событие ({formatClockHMS(effectiveNearestEvent.timestamp)})
                 </button>
               )}
             <button
               type="button"
               onClick={() => setReloadNonce((n) => n + 1)}
-              className="px-3 py-1.5 text-xs font-medium bg-white/15 hover:bg-white/25 text-white rounded-lg whitespace-nowrap transition-colors cursor-pointer"
+              className="px-3 py-1.5 text-xs font-medium bg-white/15 hover:bg-white/25 text-white rounded-xl whitespace-nowrap transition-colors cursor-pointer"
             >
               Переподключить
             </button>
@@ -1021,7 +1518,39 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
         </div>
       )}
 
-      {/* YouTube-Style Floating Bottom HUD Overlay */}
+      {/* Floating Door / Gate Open Button (Right side above bottom dock) */}
+      {linkedLock && canOpenLock && onOpenLock && (
+        <button
+          type="button"
+          disabled={isUnlocking}
+          onClick={(e) => {
+            e.stopPropagation();
+            triggerHudActivity();
+            onOpenLock(linkedLock);
+          }}
+          title={`Открыть: ${linkedLock.name}`}
+          className={`absolute right-2.5 sm:right-4 bottom-[54px] sm:bottom-[68px] z-20 px-3.5 py-2 sm:px-5 sm:py-2.5 rounded-full text-xs sm:text-sm font-semibold text-white shadow-xl inline-flex items-center gap-1.5 sm:gap-2 transition-all active:scale-95 cursor-pointer ${
+            doorUnlockedPulse
+              ? 'bg-emerald-500 hover:bg-emerald-600 shadow-emerald-950/40'
+              : isUnlocking
+                ? 'bg-[#2563EB]/80 cursor-wait'
+                : 'bg-[#2563EB] hover:bg-blue-700 shadow-blue-950/50'
+          }`}
+        >
+          {isUnlocking ? (
+            <RefreshCw className="w-3.5 h-3.5 sm:w-4 sm:h-4 animate-spin" />
+          ) : doorUnlockedPulse ? (
+            <Unlock className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+          ) : (
+            <Lock className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+          )}
+          <span>
+            {isUnlocking ? 'Открытие...' : doorUnlockedPulse ? 'Открыто' : 'Открыть'}
+          </span>
+        </button>
+      )}
+
+      {/* Bottom Floating Control Dock (Prev/Play/Next + Scrubbing Timeline + Live + Date) */}
       <div
         onMouseEnter={() => {
           hudBarHoverRef.current = true;
@@ -1031,340 +1560,283 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
           hudBarHoverRef.current = false;
         }}
         onClick={(e) => e.stopPropagation()}
-        className={`absolute inset-x-0 bottom-0 pt-12 pb-2.5 px-3.5 bg-gradient-to-t from-black/95 via-black/70 to-transparent transition-all duration-200 z-10 ${
+        className={`absolute inset-x-0 bottom-0 pt-10 pb-2 sm:pb-3.5 px-2 sm:px-4 bg-gradient-to-t from-black/90 via-black/45 to-transparent transition-all duration-200 z-20 ${
           showControls
             ? 'opacity-100 translate-y-0'
             : 'opacity-0 translate-y-1 pointer-events-none'
         }`}
       >
-        {/* Row 1: Timeline Scrubber Progress Bar */}
-        {playbackMode === 'event_mp4' ? (
-          <div className="flex items-center gap-2.5 mb-2">
-            <input
-              type="range"
-              min={0}
-              max={Math.max(1, clipDuration || activeEventDurationSec || 20)}
-              step={0.1}
-              value={Math.min(
-                clipCurrentTime,
-                Math.max(1, clipDuration || activeEventDurationSec || 20)
-              )}
-              onChange={(e) => {
-                const next = parseFloat(e.target.value);
-                setClipCurrentTime(next);
-                if (videoRef.current) {
-                  videoRef.current.currentTime = next;
-                }
-              }}
-              aria-label="Перемотка MP4 видеоролика"
-              className="w-full accent-[#3B82F6] cursor-pointer h-1.5 bg-white/25 rounded-full"
-            />
-          </div>
-        ) : playbackMode === 'archive_stream' ? (
-          <div className="mb-2 space-y-1">
-            <div className="flex items-center gap-2 text-[11px] font-mono tabular-nums text-white/80">
-              <span>{formatClockHMS(sliderBounds.minSec)}</span>
-              <input
-                type="range"
-                min={sliderBounds.minSec}
-                max={sliderBounds.maxSec}
-                step={1}
-                value={sliderDisplayTs}
-                onChange={(e) => {
-                  setScrubPreviewTs(parseInt(e.target.value, 10));
-                }}
-                onMouseUp={() => commitArchiveScrub(scrubPreviewTs)}
-                onTouchEnd={() => commitArchiveScrub(scrubPreviewTs)}
-                onKeyUp={() => commitArchiveScrub(scrubPreviewTs)}
-                aria-label="Ползунок перемотки архива"
-                className="flex-1 accent-[#3B82F6] cursor-pointer h-1.5 bg-white/25 rounded-full"
-              />
-              <span>{formatClockHMS(sliderBounds.maxSec)}</span>
-            </div>
-          </div>
-        ) : null}
+        <div className="flex items-center gap-1.5 sm:gap-2.5">
+          {/* Left Transport Buttons: Prev Event | Play/Pause | Next Event */}
+          <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+            <button
+              type="button"
+              disabled={!canArchiveInteractive}
+              onClick={handleStepPrev}
+              className="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-slate-950/85 hover:bg-slate-900 disabled:opacity-35 disabled:cursor-not-allowed border border-white/15 backdrop-blur-md text-white flex items-center justify-center shadow-lg transition-colors cursor-pointer"
+              title="Предыдущее событие / назад"
+            >
+              <SkipBack className="w-3.5 h-3.5 sm:w-4 sm:h-4 fill-current" />
+            </button>
 
-        {/* Row 2: Unified Single-Line YouTube Control Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-2 text-white">
-          {/* Left Controls: Play/Pause, Rewind Steps, Volume 0-100%, Time */}
-          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
             <button
               type="button"
               onClick={handleTogglePlayPause}
-              className="p-1.5 rounded-lg hover:bg-white/15 text-white transition-colors cursor-pointer"
+              className="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-white hover:bg-slate-100 text-slate-900 flex items-center justify-center shadow-lg transition-colors cursor-pointer"
               title={isPaused ? 'Воспроизвести' : 'Пауза'}
             >
               {isPaused ? (
-                <Play className="w-4 h-4 fill-current" />
+                <Play className="w-3.5 h-3.5 sm:w-4 sm:h-4 fill-current ml-0.5" />
               ) : (
-                <Pause className="w-4 h-4 fill-current" />
+                <Pause className="w-3.5 h-3.5 sm:w-4 sm:h-4 fill-current" />
               )}
             </button>
 
-            {playbackMode !== 'live' && (
-              <div className="flex items-center gap-0.5">
-                {seekSteps.map((step) => (
-                  <button
-                    key={step.label}
-                    type="button"
-                    onClick={() => handleStepArchiveOrClip(step.delta)}
-                    className="px-1.5 py-1 text-[11px] font-mono tabular-nums rounded-md hover:bg-white/15 text-white/90 transition-colors cursor-pointer"
-                    title={`Перемотка ${step.label}`}
-                  >
-                    {step.label}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {/* Volume 0%..100% */}
-            <div className="flex items-center gap-1.5 pl-1 pr-2 py-1 rounded-lg hover:bg-white/10 transition-colors">
-              <button
-                type="button"
-                onClick={() => {
-                  const nextMuted = !muted;
-                  setMuted(nextMuted);
-                  audioEngineRef.current?.setMuted(nextMuted);
-                }}
-                className="text-white hover:text-white/80 transition-colors cursor-pointer"
-                title={muted ? 'Включить звук' : 'Выключить звук'}
-              >
-                {muted || volume === 0 ? (
-                  <VolumeX className="w-4 h-4 text-blue-400" />
-                ) : (
-                  <Volume2 className="w-4 h-4 text-white" />
-                )}
-              </button>
-
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={muted ? 0 : Math.min(1, volume)}
-                onChange={(e) => {
-                  const v = Math.max(0, Math.min(1, parseFloat(e.target.value)));
-                  setVolume(v);
-                  if (v > 0 && muted) {
-                    setMuted(false);
-                  }
-                }}
-                aria-label="Громкость звука (0–100%)"
-                className="w-16 accent-[#3B82F6] cursor-pointer h-1 bg-white/30 rounded-full"
-              />
-
-              <span className="font-mono tabular-nums text-[11px] text-white/85 w-8 text-right">
-                {muted ? '0%' : `${Math.round(Math.min(1, volume) * 100)}%`}
-              </span>
-            </div>
-
-            {/* Time Display */}
-            <span className="text-[11px] font-mono tabular-nums text-white/90 px-1">
-              {playbackMode === 'live'
-                ? 'Прямой эфир'
-                : playbackMode === 'event_mp4'
-                ? `${formatClipTime(clipCurrentTime)} / ${formatClipTime(
-                    clipDuration || activeEventDurationSec || 20
-                  )}`
-                : formatClockHMS(sliderDisplayTs)}
-            </span>
+            <button
+              type="button"
+              disabled={playbackMode === 'live' || !canArchiveInteractive}
+              onClick={handleStepNext}
+              className="hidden sm:flex w-10 h-10 rounded-full bg-slate-950/85 hover:bg-slate-900 disabled:opacity-35 disabled:cursor-not-allowed border border-white/15 backdrop-blur-md text-white items-center justify-center shadow-lg transition-colors cursor-pointer"
+              title="Следующее событие / вперёд"
+            >
+              <SkipForward className="w-4 h-4 fill-current" />
+            </button>
           </div>
 
-          {/* Right Controls: Speed, Screenshot, Download MP4, Stream Info, Fullscreen */}
-          <div className="flex items-center gap-1">
-            {playbackMode !== 'live' && (
-              <div ref={speedMenuRef} className="relative">
-                <button
-                  type="button"
-                  onClick={() => handleTogglePopover('speed', speedMenuRef.current)}
-                  className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-mono font-semibold transition-colors cursor-pointer ${
-                    activePopover === 'speed' || playbackRate !== 1
-                      ? 'bg-[#2563EB] text-white'
-                      : 'hover:bg-white/15 text-white/90'
-                  }`}
-                  title="Скорость воспроизведения"
-                >
-                  <Gauge className="w-3.5 h-3.5" />
-                  <span>{playbackRate}x</span>
-                </button>
+          {/* Center Interactive Tick Timeline Capsule */}
+          <div className="flex-1 min-w-0 h-8 sm:h-10 rounded-full bg-slate-950/85 border border-white/15 backdrop-blur-md px-1.5 sm:px-2 flex items-center gap-1.5 sm:gap-2.5 shadow-lg">
+            {/* Live / Archive Clock Readout */}
+            <span className="px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-full bg-white/[0.09] text-[10px] sm:text-xs font-mono tabular-nums text-white shrink-0">
+              {playbackMode === 'event_mp4' && activeEventId
+                ? formatClockHMS(sliderDisplayTs)
+                : formatClockHMS(sliderDisplayTs)}
+            </span>
 
-                {activePopover === 'speed' && (
+            {/* Draggable Tick-Mark Ruler */}
+            {playbackMode === 'event_mp4' && clipDuration > 0 ? (
+              <div className="flex-1 flex items-center gap-2 min-w-0 px-1">
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(1, clipDuration || activeEventDurationSec || 20)}
+                  step={0.1}
+                  value={Math.min(
+                    clipCurrentTime,
+                    Math.max(1, clipDuration || activeEventDurationSec || 20)
+                  )}
+                  onChange={(e) => {
+                    const next = parseFloat(e.target.value);
+                    setClipCurrentTime(next);
+                    if (videoRef.current) {
+                      videoRef.current.currentTime = next;
+                    }
+                  }}
+                  aria-label="Перемотка видеоролика"
+                  className="w-full accent-[#3B82F6] cursor-pointer h-1.5 bg-white/25 rounded-full"
+                />
+              </div>
+            ) : (
+              <div
+                ref={rulerRef}
+                onPointerDown={(e) => {
+                  if (!canArchiveInteractive) return;
+                  triggerHudActivity();
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  dragStateRef.current = {
+                    startX: e.clientX,
+                    startCenterTs: sliderDisplayTs,
+                    rulerWidth: rect.width,
+                    hasDragged: false,
+                  };
+                  setScrubPreviewTs(sliderDisplayTs);
+                }}
+                onPointerMove={(e) => {
+                  const st = dragStateRef.current;
+                  if (!st) return;
+                  const dx = e.clientX - st.startX;
+                  if (Math.abs(dx) > 4) {
+                    st.hasDragged = true;
+                  }
+                  if (st.hasDragged) {
+                    const deltaSec = Math.round(
+                      (dx / Math.max(100, st.rulerWidth)) * TIMELINE_SPAN_SEC
+                    );
+                    const nextTs = Math.max(
+                      retentionMinSec,
+                      Math.min(nowLimitSec, st.startCenterTs - deltaSec)
+                    );
+                    setScrubPreviewTs(nextTs);
+                  }
+                }}
+                onPointerUp={(e) => {
+                  const st = dragStateRef.current;
+                  if (!st) return;
+                  dragStateRef.current = null;
+                  try {
+                    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                      e.currentTarget.releasePointerCapture(e.pointerId);
+                    }
+                  } catch {
+                    // ignore
+                  }
+                  if (st.hasDragged) {
+                    commitArchiveScrub(scrubPreviewTs ?? st.startCenterTs);
+                  } else {
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const frac = (e.clientX - rect.left) / Math.max(1, rect.width) - 0.5;
+                    const clickedTs = st.startCenterTs + Math.round(frac * TIMELINE_SPAN_SEC);
+                    commitArchiveScrub(clickedTs);
+                  }
+                }}
+                onPointerCancel={() => {
+                  dragStateRef.current = null;
+                  setScrubPreviewTs(null);
+                }}
+                onWheel={(e) => {
+                  if (!canArchiveInteractive) return;
+                  e.preventDefault();
+                  const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+                  const step = delta > 0 ? 180 : -180;
+                  commitArchiveScrub(sliderDisplayTs + step);
+                }}
+                title={
+                  canArchiveInteractive
+                    ? 'Потяните или нажмите на шкалу для перехода к нужному времени'
+                    : 'Архив недоступен'
+                }
+                className={`relative flex-1 h-full overflow-hidden select-none touch-none ${
+                  canArchiveInteractive
+                    ? 'cursor-grab active:cursor-grabbing'
+                    : 'opacity-45 cursor-not-allowed'
+                }`}
+              >
+                {/* Tick Marks + Half-Hour Labels */}
+                {rulerTicks.map((tick) => (
                   <div
-                    className={`absolute bottom-full mb-2 ${
-                      popoverAlign === 'left' ? 'left-0' : 'right-0'
-                    } w-44 rounded-xl bg-black/92 backdrop-blur-md border border-white/15 p-1.5 shadow-xl z-30`}
+                    key={tick.ts}
+                    style={{ left: `${tick.pct}%` }}
+                    className="absolute inset-y-0 -translate-x-1/2 flex flex-col items-center pointer-events-none"
                   >
-                    <div className="px-2.5 py-1 text-[11px] font-semibold text-white/60 border-b border-white/10 mb-1">
-                      Скорость воспроизведения
-                    </div>
-                    {SPEED_OPTIONS.map((spd) => {
-                      const selected = playbackRate === spd;
-                      return (
-                        <button
-                          key={spd}
-                          type="button"
-                          onClick={() => {
-                            setPlaybackRate(spd);
-                            if (videoRef.current) {
-                              try {
-                                videoRef.current.playbackRate = spd;
-                              } catch {
-                                // ignore
-                              }
-                            }
-                            setActivePopover(null);
-                          }}
-                          className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-mono flex items-center justify-between transition-colors cursor-pointer ${
-                            selected
-                              ? 'bg-[#2563EB] text-white font-semibold'
-                              : 'text-white/90 hover:bg-white/10'
-                          }`}
-                        >
-                          <span>{spd === 1 ? 'Обычная (1x)' : `${spd}x`}</span>
-                          {selected && <Check className="w-3.5 h-3.5" />}
-                        </button>
-                      );
-                    })}
+                    <div
+                      className={`mt-1.5 sm:mt-2 w-[1.5px] rounded-full ${
+                        tick.kind === 'major'
+                          ? 'h-4 sm:h-5'
+                          : tick.kind === 'medium'
+                            ? 'h-3 sm:h-3.5'
+                            : 'h-2 sm:h-2.5'
+                      } ${
+                        tick.isFuture
+                          ? 'bg-white/20'
+                          : tick.hasEvent
+                            ? 'bg-[#3B82F6]'
+                            : 'bg-white/80'
+                      }`}
+                    />
+                    {tick.label && (
+                      <span
+                        className={`text-[9px] font-mono tabular-nums leading-none mt-0.5 ${
+                          tick.isFuture ? 'text-white/30' : 'text-white/75'
+                        }`}
+                      >
+                        {tick.label}
+                      </span>
+                    )}
                   </div>
-                )}
+                ))}
+
+                {/* Center Vertical Playhead */}
+                <div className="absolute inset-y-1 left-1/2 -translate-x-1/2 w-[2px] rounded-full bg-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.95)] pointer-events-none" />
               </div>
             )}
 
+            {/* Live Jump Button */}
             <button
               type="button"
-              onClick={handleCaptureFrame}
-              className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg hover:bg-white/15 text-[11px] font-medium text-white/90 transition-colors cursor-pointer"
-              title="Сделать скриншот кадра"
-            >
-              <CameraIcon className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Скриншот</span>
-            </button>
-
-            {playbackMode !== 'live' && (
-              <button
-                type="button"
-                onClick={handleDownloadVideo}
-                disabled={downloadingMp4}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#2563EB] hover:bg-blue-700 disabled:opacity-60 text-white text-[11px] font-semibold transition-colors cursor-pointer"
-                title={
-                  playbackMode === 'event_mp4'
-                    ? 'Скачать полное видео события (MP4)'
-                    : `Скачать фрагмент с ${formatClockHMS(sliderDisplayTs)} до ${formatClockHMS(
-                        sliderDisplayTs + downloadDurationSec
-                      )} (${downloadDurationSec} сек, MP4)`
+              onClick={() => {
+                triggerHudActivity();
+                if (playbackMode === 'live') {
+                  setReloadNonce((n) => n + 1);
+                } else {
+                  onSwitchToLive?.();
                 }
-              >
-                {downloadingMp4 ? (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Download className="w-3.5 h-3.5" />
-                )}
-                <span className="hidden sm:inline">
-                  {downloadingMp4 ? 'Скачивание...' : 'Скачать'}
-                </span>
-              </button>
-            )}
-
-            <div ref={infoMenuRef} className="relative">
-              <button
-                type="button"
-                onClick={() => handleTogglePopover('info', infoMenuRef.current)}
-                className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                  activePopover === 'info'
-                    ? 'bg-white/25 text-white'
-                    : 'hover:bg-white/15 text-white/90'
+              }}
+              className={`px-2.5 sm:px-3 py-1 rounded-full text-[11px] sm:text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 transition-all cursor-pointer ${
+                playbackMode === 'live'
+                  ? 'bg-[#2563EB] text-white shadow-sm'
+                  : 'bg-white/12 hover:bg-white/22 text-white/90'
+              }`}
+              title={playbackMode === 'live' ? 'Прямой эфир активен' : 'Вернуться в прямой эфир'}
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  playbackMode === 'live'
+                    ? 'bg-white animate-pulse'
+                    : 'bg-rose-500'
                 }`}
-                title="Сведения и ссылка на поток"
-              >
-                <Info className="w-4 h-4" />
-              </button>
+              />
+              <span>Live</span>
+            </button>
+          </div>
 
-              {activePopover === 'info' && (
-                <div
-                  className={`absolute bottom-full mb-2 ${
-                    popoverAlign === 'left' ? 'left-0' : 'right-0'
-                  } w-72 max-w-[85vw] rounded-xl bg-black/92 backdrop-blur-md border border-white/15 p-3.5 shadow-xl text-xs text-white/90 space-y-2 z-30`}
-                >
-                  <div className="flex items-center justify-between border-b border-white/10 pb-2">
-                    <span className="font-semibold text-white">Сведения о видео</span>
-                    <span className="font-mono text-[11px] text-white/60">ID {camera.id}</span>
-                  </div>
-                  <div className="space-y-1 text-[11px]">
-                    <div className="flex justify-between gap-2">
-                      <span className="text-white/60">Камера:</span>
-                      <span className="text-right font-medium truncate">{camera.name}</span>
-                    </div>
-                    <div className="flex justify-between gap-2">
-                      <span className="text-white/60">Режим:</span>
-                      <span className="text-right">
-                        {playbackMode === 'live'
-                          ? 'Прямой эфир (FLV)'
-                          : playbackMode === 'event_mp4'
-                          ? 'Событие архива (MP4)'
-                          : 'Непрерывный DVR-поток'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between gap-2">
-                      <span className="text-white/60">Поток / звук:</span>
-                      <span className="text-right font-mono">{audioStatus.codecLabel}</span>
-                    </div>
-                    {playbackMode === 'archive_stream' && sliderBounds.hasDvrFloor && (
-                      <div className="flex justify-between gap-2">
-                        <span className="text-white/60">DVR-буфер с:</span>
-                        <span className="text-right font-mono text-amber-300">
-                          {formatClockHMS(sliderBounds.minSec)}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                  <div className="pt-1.5 border-t border-white/10 flex items-center gap-2">
-                    {upstreamUrl && playbackMode !== 'event_mp4' && (
-                      <button
-                        type="button"
-                        onClick={handleCopyStreamUrl}
-                        className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-medium transition-colors cursor-pointer"
-                      >
-                        {copiedUrl ? (
-                          <>
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                            <span>Скопировано</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            <span>URL потока</span>
-                          </>
-                        )}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setActivePopover(null);
-                        setReloadNonce((n) => n + 1);
-                      }}
-                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-medium transition-colors cursor-pointer"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      <span>Переподключить</span>
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
+          {/* Right Date Picker Pill (📅 Ср, 18) */}
+          <div ref={dateMenuRef} className="relative shrink-0">
             <button
               type="button"
-              onClick={handleFullscreen}
-              className="p-1.5 rounded-lg hover:bg-white/15 text-white/90 transition-colors cursor-pointer"
-              title={isFullscreen ? 'Выйти из полноэкранного режима' : 'Во весь экран'}
+              disabled={!canArchiveInteractive}
+              onClick={() => handleTogglePopover('date', dateMenuRef.current)}
+              className="h-8 sm:h-10 px-2.5 sm:px-3.5 rounded-full bg-slate-950/85 hover:bg-slate-900 disabled:opacity-45 disabled:cursor-not-allowed border border-white/15 backdrop-blur-md text-white text-[11px] sm:text-xs font-medium inline-flex items-center gap-1.5 shadow-lg transition-colors cursor-pointer"
+              title="Выбрать день архива"
             >
-              {isFullscreen ? (
-                <Minimize2 className="w-4 h-4" />
-              ) : (
-                <Maximize2 className="w-4 h-4" />
-              )}
+              <Calendar className="w-3.5 h-3.5 text-white/80 shrink-0" />
+              <span className="whitespace-nowrap">{formatWeekdayDayBadge(displayDayIso)}</span>
             </button>
+
+            {activePopover === 'date' && (
+              <div className="absolute bottom-full right-0 mb-2 w-56 rounded-2xl bg-slate-950/95 backdrop-blur-md border border-white/15 p-1.5 shadow-2xl z-30">
+                <div className="px-2.5 py-1.5 text-[11px] font-semibold text-white/60 border-b border-white/10 mb-1">
+                  Дата записи ({retentionDays} дн.)
+                </div>
+                <div className="max-h-60 overflow-y-auto space-y-0.5">
+                  {retentionDaysList.map((dayStr, idx) => {
+                    const selected = dayStr === displayDayIso;
+                    return (
+                      <button
+                        key={dayStr}
+                        type="button"
+                        onClick={() => {
+                          setActivePopover(null);
+                          onChangeArchiveDay?.(dayStr);
+                          if (idx === 0 && playbackMode === 'live') {
+                            const targetTs = Math.max(retentionMinSec, liveNowSec - 300);
+                            commitArchiveScrub(targetTs);
+                          } else {
+                            // Jump to matching clock hour on selected day, or 12:00 if earlier than now
+                            const curD = new Date(sliderDisplayTs * 1000);
+                            const pad = (n: number) => String(n).padStart(2, '0');
+                            const hhmmss = `${pad(curD.getHours())}:${pad(curD.getMinutes())}:00`;
+                            const candSec = Math.floor(new Date(`${dayStr}T${hhmmss}`).getTime() / 1000);
+                            const targetTs = Math.max(
+                              retentionMinSec,
+                              Math.min(nowLimitSec - 10, Number.isFinite(candSec) ? candSec : nowLimitSec - 3600)
+                            );
+                            onSeekArchiveTimestamp?.(targetTs);
+                          }
+                        }}
+                        className={`w-full px-2.5 py-1.5 rounded-xl text-xs flex items-center justify-between transition-colors cursor-pointer ${
+                          selected
+                            ? 'bg-[#2563EB] text-white font-semibold'
+                            : 'text-white/90 hover:bg-white/10'
+                        }`}
+                      >
+                        <span>{formatDayOptionLabel(dayStr, idx)}</span>
+                        {selected && <Check className="w-3.5 h-3.5 shrink-0" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

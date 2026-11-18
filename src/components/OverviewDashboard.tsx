@@ -21,6 +21,7 @@ import {
 import {
   BalanceInfo,
   BillingMePayload,
+  CameraEventItem,
   CameraItem,
   DndItem,
   DoorActionLog,
@@ -217,6 +218,17 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   const [selectedCameraId, setSelectedCameraId] = useState<string>('');
   const [liveStreamActive, setLiveStreamActive] = useState<boolean>(false);
   const [fullscreenOpen, setFullscreenOpen] = useState<boolean>(false);
+  const [inlinePlaybackMode, setInlinePlaybackMode] = useState<
+    'live' | 'archive_stream' | 'event_mp4'
+  >('live');
+  const [inlineArchiveTs, setInlineArchiveTs] = useState<number | null>(null);
+  const [inlineEventId, setInlineEventId] = useState<string | null>(null);
+  const [inlineEventDurationSec, setInlineEventDurationSec] = useState<number>(20);
+  const [inlineArchiveDay, setInlineArchiveDay] = useState<string>(() => {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  });
   const [snapTick, setSnapTick] = useState<number>(1);
   const [resolvedSnapshotUrl, setResolvedSnapshotUrl] = useState<string | null>(null);
   const [isEditingActiveName, setIsEditingActiveName] = useState<boolean>(false);
@@ -310,6 +322,12 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   useEffect(() => {
     setResolvedSnapshotUrl(null);
     setLiveStreamActive(false);
+    setInlinePlaybackMode('live');
+    setInlineArchiveTs(null);
+    setInlineEventId(null);
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    setInlineArchiveDay(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`);
     setIsEditingActiveName(false);
   }, [activeCamera?.id]);
 
@@ -947,12 +965,63 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 <CameraFeedPlayer
                   session={session}
                   camera={activeCamera}
-                  playbackMode="live"
+                  playbackMode={inlinePlaybackMode}
+                  archiveDay={inlineArchiveDay}
+                  archiveTimestampSec={inlineArchiveTs}
+                  activeEventId={inlineEventId}
+                  activeEventDurationSec={inlineEventDurationSec}
                   doorUnlockedPulse={
                     linkedLockForActiveCamera
                       ? Boolean(unlockedMap[linkedLockForActiveCamera.id])
                       : false
                   }
+                  linkedLock={linkedLockForActiveCamera}
+                  canOpenLock={Boolean(
+                    linkedLockForActiveCamera && canOpenLockItem(linkedLockForActiveCamera)
+                  )}
+                  isUnlocking={Boolean(
+                    linkedLockForActiveCamera && unlockingMap[linkedLockForActiveCamera.id]
+                  )}
+                  canViewArchive={canViewArchiveCam(activeCamera)}
+                  onOpenLock={onOpenLock}
+                  onSwitchToLive={() => {
+                    setInlinePlaybackMode('live');
+                    setInlineArchiveTs(null);
+                    setInlineEventId(null);
+                  }}
+                  onSwitchToDvrStream={() => {
+                    setInlinePlaybackMode('archive_stream');
+                    setInlineEventId(null);
+                  }}
+                  onOpenEvent={(ev: CameraEventItem) => {
+                    const isLong = (ev.duration || 0) > 300;
+                    setInlineArchiveTs(ev.timestamp);
+                    setInlineEventId(ev.id);
+                    setInlineEventDurationSec(ev.duration || 20);
+                    const d = new Date(ev.timestamp * 1000);
+                    const pad = (n: number) => String(n).padStart(2, '0');
+                    setInlineArchiveDay(
+                      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+                    );
+                    setInlinePlaybackMode(
+                      !isLong && activeCamera.videoDownloadAvailable !== false
+                        ? 'event_mp4'
+                        : 'archive_stream'
+                    );
+                  }}
+                  onChangeArchiveDay={(dayStr) => {
+                    setInlineArchiveDay(dayStr);
+                  }}
+                  onSeekArchiveTimestamp={(newTs) => {
+                    setInlineArchiveTs(newTs);
+                    setInlineEventId(null);
+                    setInlinePlaybackMode('archive_stream');
+                    const d = new Date(newTs * 1000);
+                    const pad = (n: number) => String(n).padStart(2, '0');
+                    setInlineArchiveDay(
+                      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+                    );
+                  }}
                   onCaptureNotice={onNotice}
                 />
               </div>
@@ -1463,12 +1532,63 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
               <CameraFeedPlayer
                 session={session}
                 camera={activeCamera}
-                playbackMode="live"
+                playbackMode={inlinePlaybackMode}
+                archiveDay={inlineArchiveDay}
+                archiveTimestampSec={inlineArchiveTs}
+                activeEventId={inlineEventId}
+                activeEventDurationSec={inlineEventDurationSec}
                 doorUnlockedPulse={
                   linkedLockForActiveCamera
                     ? Boolean(unlockedMap[linkedLockForActiveCamera.id])
                     : false
                 }
+                linkedLock={linkedLockForActiveCamera}
+                canOpenLock={Boolean(
+                  linkedLockForActiveCamera && canOpenLockItem(linkedLockForActiveCamera)
+                )}
+                isUnlocking={Boolean(
+                  linkedLockForActiveCamera && unlockingMap[linkedLockForActiveCamera.id]
+                )}
+                canViewArchive={canViewArchiveCam(activeCamera)}
+                onOpenLock={onOpenLock}
+                onSwitchToLive={() => {
+                  setInlinePlaybackMode('live');
+                  setInlineArchiveTs(null);
+                  setInlineEventId(null);
+                }}
+                onSwitchToDvrStream={() => {
+                  setInlinePlaybackMode('archive_stream');
+                  setInlineEventId(null);
+                }}
+                onOpenEvent={(ev: CameraEventItem) => {
+                  const isLong = (ev.duration || 0) > 300;
+                  setInlineArchiveTs(ev.timestamp);
+                  setInlineEventId(ev.id);
+                  setInlineEventDurationSec(ev.duration || 20);
+                  const d = new Date(ev.timestamp * 1000);
+                  const pad = (n: number) => String(n).padStart(2, '0');
+                  setInlineArchiveDay(
+                    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+                  );
+                  setInlinePlaybackMode(
+                    !isLong && activeCamera.videoDownloadAvailable !== false
+                      ? 'event_mp4'
+                      : 'archive_stream'
+                  );
+                }}
+                onChangeArchiveDay={(dayStr) => {
+                  setInlineArchiveDay(dayStr);
+                }}
+                onSeekArchiveTimestamp={(newTs) => {
+                  setInlineArchiveTs(newTs);
+                  setInlineEventId(null);
+                  setInlinePlaybackMode('archive_stream');
+                  const d = new Date(newTs * 1000);
+                  const pad = (n: number) => String(n).padStart(2, '0');
+                  setInlineArchiveDay(
+                    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+                  );
+                }}
                 onCaptureNotice={onNotice}
               />
             </div>
