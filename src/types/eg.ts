@@ -319,6 +319,9 @@ export interface BillingUserRecord {
   phone: string;
   accountId: string;
   subscriberId?: string;
+  deviceId?: string;
+  deviceLabel?: string;
+  canFetchDomruData?: boolean;
   name: string;
   address: string;
   role: 'admin' | 'user';
@@ -330,6 +333,30 @@ export interface BillingUserRecord {
   createdAt: number;
   lastSeenAt: number;
   notes: string;
+}
+
+export interface AdminDomruUserProfile {
+  userId: string;
+  fetchedAt: number;
+  name: string;
+  phone: string | null;
+  phones?: string[];
+  login: string | null;
+  subscriberId: string;
+  accountId: string;
+  subscriberType: string | null;
+  subscriberState: string | null;
+  balance: number | null;
+  company: string | null;
+  blocked: boolean | null;
+  places: Array<{
+    placeId: string;
+    address: string;
+    accountId: string;
+    subscriberType: string | null;
+    subscriberState: string | null;
+  }>;
+  sourceNote: string;
 }
 
 export interface BillingTransaction {

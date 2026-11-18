@@ -15,10 +15,12 @@ import {
   ShieldCheck,
   Unlock,
   Users,
+  UserSearch,
   Wallet,
   X,
 } from 'lucide-react';
 import {
+  AdminDomruUserProfile,
   AdminOverviewPayload,
   BillingSubscriptionStatus,
   BillingUserRecord,
@@ -27,6 +29,7 @@ import {
 import {
   apiAdminAdjustBalance,
   apiAdminCreateUser,
+  apiAdminFetchUserDomruData,
   apiAdminIssueNpdReceipt,
   apiAdminProcessTransaction,
   apiAdminUnlock,
@@ -150,6 +153,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   // Receipt number input map
   const [receiptInputs, setReceiptInputs] = useState<Record<string, string>>({});
 
+  // Ephemeral Dom.ru API fetched user profiles (never stored in plaintext)
+  const [domruProfiles, setDomruProfiles] = useState<
+    Record<string, { data?: AdminDomruUserProfile; error?: string }>
+  >({});
+
   // Config editor state
   const [cfgPrice, setCfgPrice] = useState<string>('50');
   const [cfgTrialDays, setCfgTrialDays] = useState<string>('7');
@@ -265,6 +273,32 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       onNotice(successMsg);
     } catch (err: any) {
       onNotice(err?.message || 'Ошибка обновления пользователя');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleFetchDomruProfile = async (userId: string) => {
+    setBusyId(`domru_${userId}`);
+    try {
+      const res = await apiAdminFetchUserDomruData(session, userId, adminPin);
+      if (res.expired || !res.domruProfile) {
+        setDomruProfiles((prev) => ({
+          ...prev,
+          [userId]: { error: res.message || 'Токен Дом.ру отсутствует или истёк' },
+        }));
+      } else {
+        setDomruProfiles((prev) => ({
+          ...prev,
+          [userId]: { data: res.domruProfile },
+        }));
+        onNotice('Актуальные данные получены напрямую из API Дом.ру');
+      }
+    } catch (err: any) {
+      setDomruProfiles((prev) => ({
+        ...prev,
+        [userId]: { error: err?.message || 'Ошибка запроса данных из API Дом.ру' },
+      }));
     } finally {
       setBusyId(null);
     }
@@ -402,6 +436,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         u.name.toLowerCase().includes(q) ||
         u.phone.toLowerCase().includes(q) ||
         u.accountId.toLowerCase().includes(q) ||
+        (u.subscriberId || '').toLowerCase().includes(q) ||
+        (u.deviceId || '').toLowerCase().includes(q) ||
+        (u.deviceLabel || '').toLowerCase().includes(q) ||
         u.address.toLowerCase().includes(q)
       );
     });
@@ -466,7 +503,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             Админ-панель и биллинг
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-            Управление пользователями, балансами, подпиской {overview?.config.monthlyPriceRub ?? 50} ₽/мес и чеками «Мой налог» (НПД {overview?.config.npdTaxRatePct ?? 4}%)
+            Управление пользователями, подпиской {overview?.config.monthlyPriceRub ?? 50} ₽/мес и чеками «Мой налог» · Данные на сервере зашифрованы (AES-256-GCM)
           </p>
         </div>
 
@@ -567,7 +604,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5">
-                    {tx.userPhone || '—'} · {formatDateTime(tx.createdAt)} · {tx.description}
+                    {formatDateTime(tx.createdAt)} · {tx.description}
                   </div>
                 </div>
 
@@ -774,6 +811,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 {filteredUsers.map((user) => {
                   const st = renderStatusLabel(user);
                   const isEditingBalance = adjustUserId === user.userId;
+                  const domruState = domruProfiles[user.userId];
+                  const isFetchingDomru = busyId === `domru_${user.userId}`;
                   return (
                     <div key={user.userId} className="py-3.5 space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-4 text-xs">
@@ -789,8 +828,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             )}
                           </div>
                           <div className="text-[11px] text-slate-400 font-mono tabular-nums truncate">
-                            {user.phone ? `+${user.phone}` : 'Без телефона'} · Л/С {user.accountId || '—'}
+                            Телефон скрыт (AES-256) · Л/С {user.accountId || '—'}
                             {!user.accountId && user.subscriberId ? ` · ID ${user.subscriberId}` : ''}
+                            {user.role !== 'admin' && (user.deviceLabel || user.deviceId)
+                              ? ` · ${user.deviceLabel || `Устр. ${user.deviceId?.slice(0, 6)}`}`
+                              : ''}
                             {user.address ? ` · ${user.address}` : ''}
                           </div>
                         </div>
@@ -818,6 +860,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
                         {/* Row Actions */}
                         <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            disabled={isFetchingDomru}
+                            onClick={() => handleFetchDomruProfile(user.userId)}
+                            title="Запросить актуальные данные напрямую через API Дом.ру"
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200/80 dark:bg-white/[0.06] dark:hover:bg-white/[0.1] text-slate-700 dark:text-slate-200 font-medium inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <UserSearch
+                              className={`w-3.5 h-3.5 text-[#2563EB] dark:text-[#3B82F6] ${
+                                isFetchingDomru ? 'animate-pulse' : ''
+                              }`}
+                            />
+                            <span>{isFetchingDomru ? 'Запрос...' : 'Запросить данные'}</span>
+                          </button>
+
                           <button
                             type="button"
                             onClick={() => {
@@ -878,6 +935,90 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           </button>
                         </div>
                       </div>
+
+                      {domruState && (
+                        <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/[0.08] text-xs space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-slate-900 dark:text-white flex items-center gap-1.5">
+                              <ShieldCheck className="w-3.5 h-3.5 text-[#2563EB] dark:text-[#3B82F6]" />
+                              <span>Ответ API Дом.ру (не сохраняется в открытом виде)</span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setDomruProfiles((prev) => {
+                                  const copy = { ...prev };
+                                  delete copy[user.userId];
+                                  return copy;
+                                })
+                              }
+                              className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 inline-flex items-center gap-1 cursor-pointer"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                              <span>Скрыть</span>
+                            </button>
+                          </div>
+
+                          {domruState.error ? (
+                            <div className="text-rose-500">{domruState.error}</div>
+                          ) : domruState.data ? (
+                            <div className="space-y-2 text-[11px] text-slate-600 dark:text-slate-300">
+                              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 font-mono">
+                                <div>
+                                  <span className="text-slate-400">ФИО: </span>
+                                  <span className="text-slate-900 dark:text-white font-semibold">
+                                    {domruState.data.name || '—'}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-slate-400">Телефон (Дом.ру): </span>
+                                  <span className="text-slate-900 dark:text-white font-semibold">
+                                    {domruState.data.phones && domruState.data.phones.length > 0
+                                      ? domruState.data.phones.map((p) => `+${p}`).join(', ')
+                                      : domruState.data.phone
+                                        ? `+${domruState.data.phone}`
+                                        : domruState.data.login || 'Не передаётся API'}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-slate-400">ID / Л/С: </span>
+                                  <span className="text-slate-900 dark:text-white">
+                                    {domruState.data.subscriberId || '—'} /{' '}
+                                    {domruState.data.accountId || '—'}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-slate-400">Тип / Баланс: </span>
+                                  <span className="text-slate-900 dark:text-white">
+                                    {domruState.data.subscriberType || '—'}
+                                    {domruState.data.balance != null
+                                      ? ` · ${domruState.data.balance} ₽`
+                                      : ''}
+                                  </span>
+                                </div>
+                              </div>
+                              {domruState.data.places.length > 0 && (
+                                <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                                  Адреса:{' '}
+                                  {domruState.data.places
+                                    .map(
+                                      (p) =>
+                                        `${p.address} (Л/С ${p.accountId || '—'}, ${
+                                          p.subscriberType || '—'
+                                        })`
+                                    )
+                                    .join('; ')}
+                                </div>
+                              )}
+                              {domruState.data.sourceNote && (
+                                <div className="text-[11px] text-slate-400">
+                                  {domruState.data.sourceNote}
+                                </div>
+                              )}
+                            </div>
+                          ) : null}
+                        </div>
+                      )}
 
                       {isEditingBalance && (
                         <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/[0.08] flex flex-wrap items-end gap-2.5 text-xs">
@@ -1274,7 +1415,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 </li>
                 <li>
                   <span className="font-semibold text-slate-900 dark:text-white">4. Доступ владельца:</span>{' '}
-                  Админ-панель открывается только при авторизации с подтверждённым телефоном <span className="font-mono">79128387309</span> или лицевым счётом <span className="font-mono">450005579792</span>.
+                  Админ-панель открывается исключительно по подтверждённому номеру телефона владельца <span className="font-mono">+79128387309</span> (общий Л/С семьи или гостевой вход не дают прав администратора).
                 </li>
               </ul>
             </div>

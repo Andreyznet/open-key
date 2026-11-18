@@ -98,10 +98,143 @@ function normalizePhone(raw: string): string {
   return digits;
 }
 
+const SERVER_DATA_DIR = path.join(__dirname, '.data');
+const MASTER_KEY_FILE = path.join(SERVER_DATA_DIR, '.master.key');
+let cachedServerEncKey: Buffer | null = null;
+
+function getServerEncryptionKey(): Buffer {
+  if (cachedServerEncKey) return cachedServerEncKey;
+
+  const envKey = String(process.env.DATA_ENCRYPTION_KEY || '').trim();
+  if (envKey) {
+    cachedServerEncKey = crypto.createHash('sha256').update(envKey, 'utf8').digest();
+    return cachedServerEncKey;
+  }
+
+  try {
+    if (fs.existsSync(MASTER_KEY_FILE)) {
+      const hex = fs.readFileSync(MASTER_KEY_FILE, 'utf8').trim();
+      const buf = Buffer.from(hex, 'hex');
+      if (buf.length === 32) {
+        cachedServerEncKey = buf;
+        return cachedServerEncKey;
+      }
+    }
+  } catch {
+    // regenerate below if unreadable
+  }
+
+  const generated = crypto.randomBytes(32);
+  try {
+    if (!fs.existsSync(SERVER_DATA_DIR)) {
+      fs.mkdirSync(SERVER_DATA_DIR, { recursive: true, mode: 0o700 });
+    }
+    fs.writeFileSync(MASTER_KEY_FILE, generated.toString('hex'), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  } catch {
+    // non-fatal; keep in memory
+  }
+  cachedServerEncKey = generated;
+  return cachedServerEncKey;
+}
+
+function hashPhone(phone: string | undefined | null): string {
+  if (!phone) return '';
+  const norm = normalizePhone(String(phone));
+  if (!norm) return '';
+  return crypto
+    .createHmac('sha256', getServerEncryptionKey())
+    .update(norm)
+    .digest('hex')
+    .slice(0, 24);
+}
+
+interface EncryptedEnvelope {
+  enc: 'aes-256-gcm';
+  v: 1;
+  iv: string;
+  tag: string;
+  data: string;
+}
+
+function writeEncryptedJsonFile(filePath: string, payload: unknown): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  const key = getServerEncryptionKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plain = JSON.stringify(payload);
+  const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const envelope: EncryptedEnvelope = {
+    enc: 'aes-256-gcm',
+    v: 1,
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    data: encrypted.toString('base64'),
+  };
+  fs.writeFileSync(filePath, JSON.stringify(envelope), { encoding: 'utf8', mode: 0o600 });
+}
+
+function readEncryptedJsonFile<T>(filePath: string): { value: T | null; wasPlaintext: boolean } {
+  if (!fs.existsSync(filePath)) {
+    return { value: null, wasPlaintext: false };
+  }
+  const raw = fs.readFileSync(filePath, 'utf8');
+  if (!raw.trim()) {
+    return { value: null, wasPlaintext: false };
+  }
+  const parsed = JSON.parse(raw);
+  if (
+    parsed &&
+    typeof parsed === 'object' &&
+    parsed.enc === 'aes-256-gcm' &&
+    typeof parsed.iv === 'string' &&
+    typeof parsed.tag === 'string' &&
+    typeof parsed.data === 'string'
+  ) {
+    const key = getServerEncryptionKey();
+    const iv = Buffer.from(parsed.iv, 'base64');
+    const tag = Buffer.from(parsed.tag, 'base64');
+    const ciphertext = Buffer.from(parsed.data, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+    return { value: JSON.parse(decrypted) as T, wasPlaintext: false };
+  }
+  return { value: parsed as T, wasPlaintext: true };
+}
+
 interface EgRequestContext {
   accessToken?: string;
   operatorId?: string;
   userAgent: UserAgentState;
+  hasExplicitUuid: boolean;
+}
+
+function sanitizeDeviceId(raw: string | undefined | null): string {
+  if (!raw) return '';
+  return String(raw)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+    .slice(0, 16);
+}
+
+function extractDeviceIdFromCtx(ctx: EgRequestContext): string {
+  if (!ctx.hasExplicitUuid) return '';
+  return sanitizeDeviceId(ctx.userAgent?.uuid);
+}
+
+function extractDeviceLabelFromCtx(ctx: EgRequestContext): string {
+  const devId = extractDeviceIdFromCtx(ctx);
+  if (!devId) return '';
+  const model = String(ctx.userAgent?.phone_model || '').trim() || 'Устройство';
+  return `${model} · ${devId.slice(0, 6)}`;
 }
 
 function extractContext(req: Request): EgRequestContext {
@@ -123,6 +256,7 @@ function extractContext(req: Request): EgRequestContext {
       // ignore invalid base64
     }
   }
+  const hasExplicitUuid = Boolean(uaRaw?.uuid && sanitizeDeviceId(uaRaw.uuid).length >= 6);
   const placeIdQuery = typeof req.query.placeId === 'string' ? req.query.placeId : undefined;
   const userAgent = createDefaultUserAgent({
     ...uaRaw,
@@ -133,6 +267,7 @@ function extractContext(req: Request): EgRequestContext {
     accessToken: authHeader || undefined,
     operatorId,
     userAgent,
+    hasExplicitUuid,
   };
 }
 
@@ -294,8 +429,8 @@ function getOwnerPhonesSet(): Set<string> {
   return set;
 }
 
-function getOwnerAccountIdsSet(): Set<string> {
-  const raw = process.env.OWNER_ACCOUNT_IDS || '450005579792';
+function getOwnerSubscriberIdsSet(): Set<string> {
+  const raw = process.env.OWNER_SUBSCRIBER_IDS || '1801607';
   const set = new Set<string>();
   for (const part of raw.split(',')) {
     const clean = part.trim();
@@ -304,13 +439,17 @@ function getOwnerAccountIdsSet(): Set<string> {
   return set;
 }
 
-function isOwnerIdentity(phone?: string, accountId?: string): boolean {
+function isOwnerIdentity(phone?: string, subscriberId?: string, phoneHash?: string): boolean {
   const normPhone = phone ? normalizePhone(String(phone)) : '';
-  const cleanAcc = accountId ? String(accountId).trim() : '';
-  return (
-    (Boolean(normPhone) && getOwnerPhonesSet().has(normPhone)) ||
-    (Boolean(cleanAcc) && getOwnerAccountIdsSet().has(cleanAcc))
-  );
+  const cleanSub = subscriberId ? String(subscriberId).trim() : '';
+  const ownerPhones = getOwnerPhonesSet();
+  if (normPhone && ownerPhones.has(normPhone)) return true;
+  if (phoneHash) {
+    for (const ownerPhone of ownerPhones) {
+      if (hashPhone(ownerPhone) === phoneHash) return true;
+    }
+  }
+  return Boolean(cleanSub) && getOwnerSubscriberIdsSet().has(cleanSub);
 }
 
 function extractSubscriberIdentity(
@@ -324,13 +463,21 @@ function extractSubscriberIdentity(
   const spSub = firstSp?.subscriber || {};
   const spPlace = firstSp?.place || {};
 
+  const subscriberPhonesRaw: any[] = Array.isArray(dataRoot?.subscriberPhones)
+    ? dataRoot.subscriberPhones
+    : [];
+  const validSubscriberPhoneObj =
+    subscriberPhonesRaw.find((p: any) => p?.number && p?.numberValid !== false) ||
+    subscriberPhonesRaw.find((p: any) => p?.number);
+
+  // Personal identity comes ONLY from /rest/v1/subscribers/profiles or explicit login fallback.
+  // Never inherit phone/id/name from subscriber-places (which reflects the shared apartment contract holder).
   const rawPhone =
     sub.phone ||
     sub.login ||
     sub.msisdn ||
     dataRoot.phone ||
-    spSub.phone ||
-    spSub.login ||
+    validSubscriberPhoneObj?.number ||
     fallback?.phone ||
     '';
   const phone = rawPhone ? normalizePhone(String(rawPhone)) : '';
@@ -348,9 +495,6 @@ function extractSubscriberIdentity(
     sub.id ??
     sub.subscriberId ??
     dataRoot.subscriberId ??
-    spSub.id ??
-    spSub.subscriberId ??
-    firstSp?.id ??
     fallback?.subscriberId ??
     '';
   const subscriberId =
@@ -358,7 +502,7 @@ function extractSubscriberIdentity(
       ? String(rawSubId).trim()
       : '';
 
-  const rawName = sub.name || dataRoot.name || spSub.name || fallback?.name || '';
+  const rawName = sub.name || dataRoot.name || fallback?.name || '';
   const name = String(rawName || '').trim();
 
   return { phone, accountId, subscriberId, name };
@@ -380,7 +524,7 @@ function cacheVerifiedSession(
     accountId: cleanAcc,
     subscriberId: cleanSubId,
     name: cleanName,
-    isOwner: isOwnerIdentity(cleanPhone, cleanAcc),
+    isOwner: isOwnerIdentity(cleanPhone, cleanSubId),
     verifiedAt: Date.now(),
   };
   if (accessToken && !accessToken.startsWith('demo_')) {
@@ -428,7 +572,7 @@ async function resolveVerifiedSession(req: Request): Promise<{
     return {
       authenticated: true,
       isDemo: false,
-      isOwner: isOwnerIdentity(cached.phone, cached.accountId),
+      isOwner: isOwnerIdentity(cached.phone, cached.subscriberId),
       phone: cached.phone,
       accountId: cached.accountId,
       subscriberId: cached.subscriberId || '',
@@ -442,7 +586,7 @@ async function resolveVerifiedSession(req: Request): Promise<{
       let placesList: any[] = [];
       const preliminary = extractSubscriberIdentity(profileRes.data, [], cached);
 
-      if (!preliminary.accountId || !preliminary.phone || !preliminary.subscriberId) {
+      if (!preliminary.accountId) {
         try {
           const placesRes = await egFetch('/rest/v3/subscriber-places', ctx);
           if (Array.isArray(placesRes.data?.data)) {
@@ -532,10 +676,7 @@ async function startServer() {
 
   function loadEsp32ConfigFromDisk() {
     try {
-      if (!fs.existsSync(ESP32_CONFIG_FILE)) return;
-      const raw = fs.readFileSync(ESP32_CONFIG_FILE, 'utf8');
-      if (!raw.trim()) return;
-      const parsed = JSON.parse(raw);
+      const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(ESP32_CONFIG_FILE);
       if (parsed && typeof parsed === 'object') {
         esp32Config = {
           ...esp32Config,
@@ -545,6 +686,9 @@ async function startServer() {
             Math.min(5000, Number(parsed.pulseDurationMs ?? esp32Config.pulseDurationMs) || 600)
           ),
         };
+        if (wasPlaintext) {
+          saveEsp32ConfigToDisk();
+        }
       }
     } catch {
       // ignore invalid config file
@@ -553,10 +697,7 @@ async function startServer() {
 
   function saveEsp32ConfigToDisk() {
     try {
-      if (!fs.existsSync(ESP32_DATA_DIR)) {
-        fs.mkdirSync(ESP32_DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(ESP32_CONFIG_FILE, JSON.stringify(esp32Config, null, 2), 'utf8');
+      writeEncryptedJsonFile(ESP32_CONFIG_FILE, esp32Config);
     } catch {
       // ignore disk error
     }
@@ -565,19 +706,19 @@ async function startServer() {
   loadEsp32ConfigFromDisk();
 
   // =========================================================================
-  // Per-User Custom Camera Names (Aliases) persisted in .data/camera-aliases.json
+  // Per-User Custom Camera Names (Aliases) persisted encrypted in .data/camera-aliases.json
   // =========================================================================
   const CAMERA_ALIASES_FILE = path.join(ESP32_DATA_DIR, 'camera-aliases.json');
   let cameraAliasesByUser: Record<string, Record<string, string>> = {};
 
   function loadCameraAliasesFromDisk() {
     try {
-      if (!fs.existsSync(CAMERA_ALIASES_FILE)) return;
-      const raw = fs.readFileSync(CAMERA_ALIASES_FILE, 'utf8');
-      if (!raw.trim()) return;
-      const parsed = JSON.parse(raw);
+      const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(CAMERA_ALIASES_FILE);
       if (parsed && typeof parsed.aliasesByUser === 'object' && parsed.aliasesByUser !== null) {
         cameraAliasesByUser = parsed.aliasesByUser;
+        if (wasPlaintext) {
+          saveCameraAliasesToDisk();
+        }
       }
     } catch {
       // ignore corrupted alias store
@@ -586,14 +727,7 @@ async function startServer() {
 
   function saveCameraAliasesToDisk() {
     try {
-      if (!fs.existsSync(ESP32_DATA_DIR)) {
-        fs.mkdirSync(ESP32_DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(
-        CAMERA_ALIASES_FILE,
-        JSON.stringify({ aliasesByUser: cameraAliasesByUser }, null, 2),
-        'utf8'
-      );
+      writeEncryptedJsonFile(CAMERA_ALIASES_FILE, { aliasesByUser: cameraAliasesByUser });
     } catch {
       // ignore disk write error
     }
@@ -980,7 +1114,12 @@ async function startServer() {
 
       cacheVerifiedSession(accessToken, extracted);
 
-      upsertBillingUserFromIdentity(extracted);
+      const authedUser = upsertBillingUserFromIdentity({
+        ...extracted,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
+      });
+      rememberUserDomruSession(authedUser.userId, ctx);
 
       res.json({
         accessToken,
@@ -1101,10 +1240,13 @@ async function startServer() {
 
       cacheVerifiedSession(accessToken, extracted);
 
-      upsertBillingUserFromIdentity({
+      const smsUser = upsertBillingUserFromIdentity({
         ...extracted,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         address: contract?.address || '',
       });
+      rememberUserDomruSession(smsUser.userId, ctx);
 
       res.json({
         accessToken,
@@ -1155,7 +1297,12 @@ async function startServer() {
 
       cacheVerifiedSession(accessToken, extracted);
 
-      upsertBillingUserFromIdentity(extracted);
+      const tokUser = upsertBillingUserFromIdentity({
+        ...extracted,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
+      });
+      rememberUserDomruSession(tokUser.userId, ctx);
 
       res.json({
         accessToken,
@@ -1593,9 +1740,12 @@ async function startServer() {
         phone: syncIdentity.phone,
         accountId: syncIdentity.accountId,
         subscriberId: syncIdentity.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: syncIdentity.name,
         address: places[0]?.address || '',
       });
+      rememberUserDomruSession(syncedUser.userId, ctx);
 
       for (const lock of locks) {
         rememberPlaceControlCamera(
@@ -2792,10 +2942,8 @@ async function startServer() {
 
   function loadLocalGuestPassesFromDisk() {
     try {
-      if (!fs.existsSync(GUEST_PASSES_FILE)) return;
-      const raw = fs.readFileSync(GUEST_PASSES_FILE, 'utf8');
-      if (!raw.trim()) return;
-      const parsed = JSON.parse(raw);
+      const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(GUEST_PASSES_FILE);
+      if (!parsed) return;
       const list: LocalGuestPassRecord[] = Array.isArray(parsed?.passes) ? parsed.passes : [];
       const now = Date.now();
       for (const rec of list) {
@@ -2806,6 +2954,9 @@ async function startServer() {
           }
         }
       }
+      if (wasPlaintext) {
+        saveLocalGuestPassesToDisk();
+      }
     } catch {
       // ignore corrupted store
     }
@@ -2813,13 +2964,10 @@ async function startServer() {
 
   function saveLocalGuestPassesToDisk() {
     try {
-      if (!fs.existsSync(GUEST_PASSES_DATA_DIR)) {
-        fs.mkdirSync(GUEST_PASSES_DATA_DIR, { recursive: true });
-      }
       const payload = {
         passes: Array.from(localGuestPasses.values()),
       };
-      fs.writeFileSync(GUEST_PASSES_FILE, JSON.stringify(payload, null, 2), 'utf8');
+      writeEncryptedJsonFile(GUEST_PASSES_FILE, payload);
     } catch {
       // ignore disk write failure
     }
@@ -2863,10 +3011,13 @@ async function startServer() {
     const verified = await resolveVerifiedSession(req);
     if (verified.isDemo) return 'demo_subscriber';
     if (!verified.authenticated) return null;
+    const ctx = extractContext(req);
     const user = upsertBillingUserFromIdentity({
       phone: verified.phone,
       accountId: verified.accountId,
       subscriberId: verified.subscriberId,
+      deviceId: extractDeviceIdFromCtx(ctx),
+      deviceLabel: extractDeviceLabelFromCtx(ctx),
       name: verified.name,
     });
     return user.userId;
@@ -2876,22 +3027,29 @@ async function startServer() {
     if (record.ownerUserId) return record.ownerUserId;
     const token = record.ownerCtx?.accessToken || '';
     if (token.startsWith('demo_')) return 'demo_subscriber';
+    const ownerDevId = sanitizeDeviceId(record.ownerCtx?.userAgent?.uuid);
     if (token) {
       const cached = verifiedSessionMap.get(token);
       if (cached) {
-        const matched = billingStore.users.find(
-          (u) =>
-            (cached.phone && u.phone && normalizePhone(u.phone) === normalizePhone(cached.phone)) ||
-            (cached.accountId && u.accountId && u.accountId === cached.accountId)
-        );
+        const matched = billingStore.users.find((u) => {
+          if (isOwnerIdentity(cached.phone, cached.subscriberId)) {
+            return isOwnerIdentity(u.phone, u.subscriberId, u.phoneHash);
+          }
+          if (isOwnerIdentity(u.phone, u.subscriberId, u.phoneHash)) return false;
+          if (ownerDevId && u.deviceId && u.deviceId !== ownerDevId) return false;
+          const cachedPhoneH = cached.phone ? hashPhone(cached.phone) : '';
+          return (
+            (cachedPhoneH && u.phoneHash && u.phoneHash === cachedPhoneH) ||
+            (cached.subscriberId &&
+              u.subscriberId &&
+              String(u.subscriberId) === String(cached.subscriberId))
+          );
+        });
         if (matched) return matched.userId;
       }
     }
-    const accId = record.ownerCtx?.userAgent?.account_id
-      ? String(record.ownerCtx.userAgent.account_id).trim()
-      : '';
-    if (accId) {
-      const matched = billingStore.users.find((u) => u.accountId && u.accountId === accId);
+    if (ownerDevId) {
+      const matched = billingStore.users.find((u) => u.deviceId && u.deviceId === ownerDevId);
       if (matched) return matched.userId;
     }
     return null;
@@ -3657,8 +3815,11 @@ async function startServer() {
   interface ServerBillingUser {
     userId: string;
     phone: string;
+    phoneHash?: string;
     accountId: string;
     subscriberId?: string;
+    deviceId?: string;
+    deviceLabel?: string;
     name: string;
     address: string;
     role: 'admin' | 'user';
@@ -3670,6 +3831,13 @@ async function startServer() {
     createdAt: number;
     lastSeenAt: number;
     notes: string;
+  }
+
+  interface StoredDomruSession {
+    accessToken: string;
+    operatorId: string;
+    userAgent: UserAgentState;
+    updatedAt: number;
   }
 
   interface ServerBillingTx {
@@ -3710,7 +3878,84 @@ async function startServer() {
   }
 
   const BILLING_FILE = path.join(GUEST_PASSES_DATA_DIR, 'billing-users.json');
+  const DOMRU_SESSIONS_FILE = path.join(GUEST_PASSES_DATA_DIR, 'domru-sessions.json');
   const DAY_MS = 86400 * 1000;
+
+  const userDomruSessionMap = new Map<string, StoredDomruSession>();
+
+  function loadDomruSessionsFromDisk() {
+    try {
+      const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(DOMRU_SESSIONS_FILE);
+      if (parsed && typeof parsed.sessions === 'object' && parsed.sessions !== null) {
+        for (const [uid, sess] of Object.entries(parsed.sessions as Record<string, any>)) {
+          if (uid && sess && typeof sess.accessToken === 'string' && sess.accessToken) {
+            userDomruSessionMap.set(uid, {
+              accessToken: sess.accessToken,
+              operatorId: String(sess.operatorId || '1'),
+              userAgent: sess.userAgent || createDefaultUserAgent(),
+              updatedAt: Number(sess.updatedAt) || Date.now(),
+            });
+          }
+        }
+        if (wasPlaintext) {
+          saveDomruSessionsToDisk();
+        }
+      }
+    } catch {
+      // ignore corrupted sessions vault
+    }
+  }
+
+  function saveDomruSessionsToDisk() {
+    try {
+      const sessionsObj: Record<string, StoredDomruSession> = {};
+      for (const [uid, sess] of userDomruSessionMap.entries()) {
+        sessionsObj[uid] = sess;
+      }
+      writeEncryptedJsonFile(DOMRU_SESSIONS_FILE, { sessions: sessionsObj });
+    } catch {
+      // ignore disk write failure
+    }
+  }
+
+  function rememberUserDomruSession(userId: string, ctx: EgRequestContext) {
+    if (!userId || !ctx.accessToken || ctx.accessToken.startsWith('demo_')) return;
+    const prev = userDomruSessionMap.get(userId);
+    const now = Date.now();
+    if (
+      prev &&
+      prev.accessToken === ctx.accessToken &&
+      prev.operatorId === (ctx.operatorId || '1') &&
+      now - prev.updatedAt < 5 * 60 * 1000
+    ) {
+      return;
+    }
+    userDomruSessionMap.set(userId, {
+      accessToken: ctx.accessToken,
+      operatorId: ctx.operatorId || '1',
+      userAgent: ctx.userAgent,
+      updatedAt: now,
+    });
+    saveDomruSessionsToDisk();
+  }
+
+  loadDomruSessionsFromDisk();
+
+  function sanitizeBillingUserForClient(u: ServerBillingUser) {
+    const { phoneHash: _ph, ...rest } = u;
+    return {
+      ...rest,
+      phone: '',
+      canFetchDomruData: Boolean(userDomruSessionMap.get(u.userId)?.accessToken),
+    };
+  }
+
+  function sanitizeBillingTxForClient(tx: ServerBillingTx): ServerBillingTx {
+    return {
+      ...tx,
+      userPhone: '',
+    };
+  }
 
   function createDefaultBillingStore(): ServerBillingStore {
     const now = Date.now();
@@ -3733,8 +3978,10 @@ async function startServer() {
       users: [
         {
           userId: 'usr_owner_450005579792',
-          phone: '79128387309',
+          phone: '',
+          phoneHash: hashPhone('79128387309'),
           accountId: '450005579792',
+          subscriberId: '1801607',
           name: 'Владелец Open-Key',
           address: 'Владелец сервиса Open-Key',
           role: 'admin',
@@ -3753,7 +4000,7 @@ async function startServer() {
           id: 'tx_seed_topup_1',
           userId: 'usr_owner_450005579792',
           userName: 'Владелец Open-Key',
-          userPhone: '79128387309',
+          userPhone: '',
           type: 'topup',
           status: 'completed',
           amountRub: 200,
@@ -3767,7 +4014,7 @@ async function startServer() {
           id: 'tx_seed_sub_1',
           userId: 'usr_owner_450005579792',
           userName: 'Владелец Open-Key',
-          userPhone: '79128387309',
+          userPhone: '',
           type: 'subscription_charge',
           status: 'completed',
           amountRub: -50,
@@ -3785,10 +4032,7 @@ async function startServer() {
 
   function loadBillingStoreFromDisk() {
     try {
-      if (!fs.existsSync(BILLING_FILE)) return;
-      const raw = fs.readFileSync(BILLING_FILE, 'utf8');
-      if (!raw.trim()) return;
-      const parsed = JSON.parse(raw);
+      const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(BILLING_FILE);
       if (parsed && Array.isArray(parsed.users) && parsed.config) {
         const mergedCfg = {
           ...createDefaultBillingStore().config,
@@ -3816,24 +4060,46 @@ async function startServer() {
           mergedCfg.paymentMethodLabel = 'ЮKassa (Карты РФ, СБП) · чек «Мой налог»';
         }
 
-        // Sanitize roles on load: strictly only configured owner(s) keep 'admin' role
+        let scrubbedPlaintextPhone = false;
         const sanitizedUsers: ServerBillingUser[] = parsed.users
           .filter((u: ServerBillingUser) => u && u.userId !== 'usr_owner_2094815')
-          .map((u: ServerBillingUser) => ({
-            ...u,
-            phone: u.phone ? normalizePhone(String(u.phone)) : '',
-            accountId: u.accountId ? String(u.accountId).trim() : '',
-            subscriberId: u.subscriberId ? String(u.subscriberId).trim() : '',
-            name: String(u.name || '').trim(),
-            role: isOwnerIdentity(u.phone, u.accountId) ? 'admin' : 'user',
-          }));
+          .map((u: ServerBillingUser) => {
+            const legacyPhone = u.phone ? normalizePhone(String(u.phone)) : '';
+            if (legacyPhone) scrubbedPlaintextPhone = true;
+            const computedHash = u.phoneHash || (legacyPhone ? hashPhone(legacyPhone) : '');
+            const cleanSubId = u.subscriberId ? String(u.subscriberId).trim() : '';
+            const isOwner = isOwnerIdentity(legacyPhone, cleanSubId, computedHash);
+            return {
+              ...u,
+              phone: '',
+              phoneHash: computedHash,
+              accountId: u.accountId ? String(u.accountId).trim() : '',
+              subscriberId: cleanSubId,
+              deviceId: u.deviceId ? sanitizeDeviceId(u.deviceId) : '',
+              deviceLabel: u.deviceLabel ? String(u.deviceLabel).trim() : '',
+              name: String(u.name || '').trim(),
+              role: isOwner ? 'admin' : 'user',
+              status: isOwner && u.status === 'blocked' ? 'active' : u.status,
+            };
+          });
+
+        const sanitizedTxs: ServerBillingTx[] = (
+          Array.isArray(parsed.transactions) ? parsed.transactions : []
+        ).map((tx: ServerBillingTx) => {
+          if (tx.userPhone) scrubbedPlaintextPhone = true;
+          return {
+            ...tx,
+            userPhone: '',
+          };
+        });
 
         billingStore = {
           config: mergedCfg,
           users: sanitizedUsers,
-          transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
+          transactions: sanitizedTxs,
         };
-        if (deduplicateBillingUsers()) {
+        const merged = deduplicateBillingUsers();
+        if (merged || wasPlaintext || scrubbedPlaintextPhone) {
           saveBillingStoreToDisk();
         }
       }
@@ -3848,17 +4114,23 @@ async function startServer() {
     }
 
     const canMergeUsers = (a: ServerBillingUser, b: ServerBillingUser): boolean => {
-      const aPhone = a.phone ? normalizePhone(a.phone) : '';
-      const bPhone = b.phone ? normalizePhone(b.phone) : '';
-      if (aPhone && bPhone && aPhone === bPhone) return true;
+      const aOwner = isOwnerIdentity(a.phone, a.subscriberId, a.phoneHash);
+      const bOwner = isOwnerIdentity(b.phone, b.subscriberId, b.phoneHash);
+      // Owner is a single unified admin account; never merge owner with non-owners
+      if (aOwner !== bOwner) return false;
+      if (aOwner && bOwner) return true;
 
-      const aAcc = a.accountId ? String(a.accountId).trim() : '';
-      const bAcc = b.accountId ? String(b.accountId).trim() : '';
-      if (aAcc && bAcc && aAcc === bAcc) return true;
+      // For regular users: NEVER merge two distinct devices, and NEVER merge by shared accountId
+      const aDev = sanitizeDeviceId(a.deviceId);
+      const bDev = sanitizeDeviceId(b.deviceId);
+      if (aDev && bDev && aDev !== bDev) return false;
+      if (!aDev || !bDev || aDev !== bDev) return false;
+
+      if (a.phoneHash && b.phoneHash) return a.phoneHash === b.phoneHash;
 
       const aSub = a.subscriberId ? String(a.subscriberId).trim() : '';
       const bSub = b.subscriberId ? String(b.subscriberId).trim() : '';
-      if (aSub && bSub && aSub === bSub) return true;
+      if (aSub && bSub) return aSub === bSub;
 
       const aName = String(a.name || '').trim().toLowerCase();
       const bName = String(b.name || '').trim().toLowerCase();
@@ -3867,10 +4139,7 @@ async function startServer() {
         bName &&
         aName === bName &&
         aName !== 'новый пользователь' &&
-        !aName.startsWith('абонент') &&
-        (!aPhone || !bPhone || aPhone === bPhone) &&
-        (!aAcc || !bAcc || aAcc === bAcc) &&
-        (!aSub || !bSub || aSub === bSub)
+        !aName.startsWith('абонент')
       ) {
         return true;
       }
@@ -3907,15 +4176,16 @@ async function startServer() {
         continue;
       }
 
-      // Prefer deterministic/admin/blocked/oldest record as canonical ID
       const sorted = [...group].sort((a, b) => {
-        const aAdmin = isOwnerIdentity(a.phone, a.accountId) ? 1 : 0;
-        const bAdmin = isOwnerIdentity(b.phone, b.accountId) ? 1 : 0;
+        const aAdmin = isOwnerIdentity(a.phone, a.subscriberId, a.phoneHash) ? 1 : 0;
+        const bAdmin = isOwnerIdentity(b.phone, b.subscriberId, b.phoneHash) ? 1 : 0;
         if (aAdmin !== bAdmin) return bAdmin - aAdmin;
+        if (a.userId === 'usr_owner_450005579792') return -1;
+        if (b.userId === 'usr_owner_450005579792') return 1;
         const pDiff = statusPriority(b.status) - statusPriority(a.status);
         if (pDiff !== 0) return pDiff;
-        const aRich = (a.phone ? 4 : 0) + (a.accountId ? 2 : 0) + (a.address ? 1 : 0);
-        const bRich = (b.phone ? 4 : 0) + (b.accountId ? 2 : 0) + (b.address ? 1 : 0);
+        const aRich = (a.phoneHash ? 4 : 0) + (a.deviceId ? 2 : 0) + (a.address ? 1 : 0);
+        const bRich = (b.phoneHash ? 4 : 0) + (b.deviceId ? 2 : 0) + (b.address ? 1 : 0);
         if (aRich !== bRich) return bRich - aRich;
         return (a.createdAt || 0) - (b.createdAt || 0);
       });
@@ -3927,9 +4197,11 @@ async function startServer() {
       for (let i = 1; i < sorted.length; i++) {
         const dup = sorted[i];
         remapIds.set(dup.userId, primary.userId);
-        if (!primary.phone && dup.phone) primary.phone = dup.phone;
+        if (!primary.phoneHash && dup.phoneHash) primary.phoneHash = dup.phoneHash;
         if (!primary.accountId && dup.accountId) primary.accountId = dup.accountId;
         if (!primary.subscriberId && dup.subscriberId) primary.subscriberId = dup.subscriberId;
+        if (!primary.deviceId && dup.deviceId) primary.deviceId = dup.deviceId;
+        if (!primary.deviceLabel && dup.deviceLabel) primary.deviceLabel = dup.deviceLabel;
         if (!primary.address && dup.address) primary.address = dup.address;
         if (!primary.notes && dup.notes) primary.notes = dup.notes;
         if (
@@ -3952,9 +4224,11 @@ async function startServer() {
         }
       }
 
-      primary.status = bestStatus;
+      const primaryIsOwner = isOwnerIdentity(primary.phone, primary.subscriberId, primary.phoneHash);
+      primary.phone = '';
+      primary.status = primaryIsOwner && bestStatus === 'blocked' ? 'active' : bestStatus;
       primary.balanceRub = Number(totalBalance.toFixed(2));
-      primary.role = isOwnerIdentity(primary.phone, primary.accountId) ? 'admin' : 'user';
+      primary.role = primaryIsOwner ? 'admin' : 'user';
       mergedUsers.push(primary);
     }
 
@@ -3963,6 +4237,18 @@ async function startServer() {
       if (mapped) {
         tx.userId = mapped;
       }
+      tx.userPhone = '';
+    }
+
+    for (const [oldId, primaryId] of remapIds.entries()) {
+      const oldSess = userDomruSessionMap.get(oldId);
+      if (oldSess && !userDomruSessionMap.has(primaryId)) {
+        userDomruSessionMap.set(primaryId, oldSess);
+      }
+      userDomruSessionMap.delete(oldId);
+    }
+    if (remapIds.size > 0) {
+      saveDomruSessionsToDisk();
     }
 
     billingStore.users = mergedUsers;
@@ -3971,10 +4257,17 @@ async function startServer() {
 
   function saveBillingStoreToDisk() {
     try {
-      if (!fs.existsSync(GUEST_PASSES_DATA_DIR)) {
-        fs.mkdirSync(GUEST_PASSES_DATA_DIR, { recursive: true });
+      // Never write plaintext phone numbers to disk
+      for (const u of billingStore.users) {
+        if (u.phone) {
+          if (!u.phoneHash) u.phoneHash = hashPhone(u.phone);
+          u.phone = '';
+        }
       }
-      fs.writeFileSync(BILLING_FILE, JSON.stringify(billingStore, null, 2), 'utf8');
+      for (const tx of billingStore.transactions) {
+        if (tx.userPhone) tx.userPhone = '';
+      }
+      writeEncryptedJsonFile(BILLING_FILE, billingStore);
     } catch {
       // ignore disk write failure
     }
@@ -4181,64 +4474,111 @@ async function startServer() {
     phone?: string;
     accountId?: string;
     subscriberId?: string;
+    deviceId?: string;
+    deviceLabel?: string;
     name?: string;
     address?: string;
   }): ServerBillingUser {
     const now = Date.now();
     const cleanPhone = identity.phone ? normalizePhone(String(identity.phone)) : '';
+    const cleanPhoneHash = cleanPhone ? hashPhone(cleanPhone) : '';
     const cleanAccountId = identity.accountId ? String(identity.accountId).trim() : '';
     const cleanSubscriberId = identity.subscriberId ? String(identity.subscriberId).trim() : '';
+    const cleanDeviceId = sanitizeDeviceId(identity.deviceId);
+    const cleanDeviceLabel = identity.deviceLabel ? String(identity.deviceLabel).trim() : '';
     const cleanName = identity.name ? String(identity.name).trim() : '';
     const cleanNameLower = cleanName.toLowerCase();
     const cleanAddress = identity.address ? String(identity.address).trim() : '';
 
-    let user = billingStore.users.find(
-      (u) =>
-        (identity.userId && u.userId === identity.userId) ||
-        (cleanPhone && u.phone && normalizePhone(u.phone) === cleanPhone) ||
-        (cleanAccountId && u.accountId && u.accountId === cleanAccountId) ||
-        (cleanSubscriberId && u.subscriberId && String(u.subscriberId) === cleanSubscriberId) ||
-        (cleanNameLower &&
-          cleanNameLower !== 'новый пользователь' &&
-          !cleanNameLower.startsWith('абонент') &&
-          u.name &&
-          u.name.trim().toLowerCase() === cleanNameLower &&
-          (!cleanPhone || !u.phone || normalizePhone(u.phone) === cleanPhone) &&
-          (!cleanAccountId || !u.accountId || u.accountId === cleanAccountId) &&
-          (!cleanSubscriberId || !u.subscriberId || String(u.subscriberId) === cleanSubscriberId))
-    );
+    const ownerMatch = isOwnerIdentity(cleanPhone, cleanSubscriberId, cleanPhoneHash);
 
-    const ownerMatch = isOwnerIdentity(cleanPhone, cleanAccountId);
+    // Checks if an existing record represents the same personal subscriber login (ignoring shared accountId!)
+    const samePersonalSubscriber = (u: ServerBillingUser): boolean => {
+      if (cleanPhoneHash && u.phoneHash && u.phoneHash === cleanPhoneHash) return true;
+      if (cleanPhoneHash && u.phoneHash && u.phoneHash !== cleanPhoneHash) return false;
+      if (cleanSubscriberId && u.subscriberId && String(u.subscriberId) === cleanSubscriberId) {
+        return true;
+      }
+      if (cleanSubscriberId && u.subscriberId && String(u.subscriberId) !== cleanSubscriberId) {
+        return false;
+      }
+      if (
+        cleanNameLower &&
+        cleanNameLower !== 'новый пользователь' &&
+        !cleanNameLower.startsWith('абонент') &&
+        u.name &&
+        u.name.trim().toLowerCase() === cleanNameLower
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    let user: ServerBillingUser | undefined;
+
+    if (ownerMatch) {
+      user = billingStore.users.find(
+        (u) =>
+          (identity.userId && u.userId === identity.userId) ||
+          isOwnerIdentity(u.phone, u.subscriberId, u.phoneHash)
+      );
+    } else {
+      user = billingStore.users.find((u) => {
+        if (isOwnerIdentity(u.phone, u.subscriberId, u.phoneHash)) return false;
+        if (identity.userId && u.userId === identity.userId) return true;
+        if (!samePersonalSubscriber(u)) return false;
+        const uDev = sanitizeDeviceId(u.deviceId);
+        // Distinct device installations must remain separate paid billing accounts,
+        // even when users share the same Dom.ru guest login or apartment accountId.
+        if (cleanDeviceId && uDev) {
+          return uDev === cleanDeviceId;
+        }
+        return !uDev || !cleanDeviceId;
+      });
+    }
 
     if (!user) {
       const trialDays = Math.max(0, Number(billingStore.config.trialDays) || 7);
-      const nameHash = cleanNameLower
-        ? crypto.createHash('sha1').update(cleanNameLower).digest('hex').slice(0, 10)
-        : '';
+      let resolvedTrialEndsAt = now + trialDays * DAY_MS;
+
+      // Prevent free-trial farming via Incognito / second browser on the exact same Dom.ru login:
+      // separate devices still get separate paid accounts, but inherit the earliest trial end date of that login.
+      if (!ownerMatch) {
+        const siblingUsers = billingStore.users.filter(
+          (u) => !isOwnerIdentity(u.phone, u.subscriberId, u.phoneHash) && samePersonalSubscriber(u)
+        );
+        if (siblingUsers.length > 0) {
+          const earliestTrial = Math.min(
+            ...siblingUsers.map((s) => (Number.isFinite(s.trialEndsAt) ? s.trialEndsAt : now))
+          );
+          resolvedTrialEndsAt = Math.min(resolvedTrialEndsAt, earliestTrial);
+        }
+      }
+
+      const subKey = cleanPhoneHash || cleanSubscriberId || cleanNameLower || 'anon';
+      const deterministicSeed = cleanDeviceId ? `${subKey}|${cleanDeviceId}` : subKey;
+      const hash12 = crypto.createHash('sha1').update(deterministicSeed).digest('hex').slice(0, 12);
       const resolvedId =
         identity.userId ||
-        (cleanPhone
-          ? `usr_${cleanPhone}`
-          : cleanAccountId
-            ? `usr_acc_${cleanAccountId}`
-            : cleanSubscriberId
-              ? `usr_sub_${cleanSubscriberId}`
-              : nameHash
-                ? `usr_name_${nameHash}`
-                : `usr_${crypto.randomBytes(5).toString('hex')}`);
+        (ownerMatch
+          ? 'usr_owner_450005579792'
+          : `usr_${hash12}`);
 
       user = {
         userId: resolvedId,
-        phone: cleanPhone,
+        phone: '',
+        phoneHash: cleanPhoneHash,
         accountId: cleanAccountId,
         subscriberId: cleanSubscriberId,
-        name: cleanName || (cleanPhone ? `Абонент +${cleanPhone}` : 'Новый пользователь'),
+        deviceId: ownerMatch ? '' : cleanDeviceId,
+        deviceLabel: ownerMatch ? '' : cleanDeviceLabel,
+        name: cleanName || 'Пользователь Open-Key',
         address: cleanAddress,
         role: ownerMatch ? 'admin' : 'user',
         balanceRub: 0,
-        status: trialDays > 0 ? 'trial' : 'expired',
+        status: trialDays > 0 && resolvedTrialEndsAt > now ? 'trial' : 'expired',
         autoRenew: true,
-        trialEndsAt: now + trialDays * DAY_MS,
+        trialEndsAt: resolvedTrialEndsAt,
         paidUntil: null,
         createdAt: now,
         lastSeenAt: now,
@@ -4246,14 +4586,21 @@ async function startServer() {
       };
       billingStore.users.unshift(user);
     } else {
-      if (cleanPhone && !user.phone) user.phone = cleanPhone;
+      user.phone = '';
+      if (cleanPhoneHash && !user.phoneHash) user.phoneHash = cleanPhoneHash;
       if (cleanAccountId && !user.accountId) user.accountId = cleanAccountId;
       if (cleanSubscriberId && !user.subscriberId) user.subscriberId = cleanSubscriberId;
-      if (cleanName && (!user.name || user.name.startsWith('Абонент') || user.name.startsWith('Новый'))) {
+      if (!ownerMatch && cleanDeviceId && !user.deviceId) user.deviceId = cleanDeviceId;
+      if (!ownerMatch && cleanDeviceLabel) user.deviceLabel = cleanDeviceLabel;
+      if (cleanName && (!user.name || user.name.startsWith('Абонент') || user.name.startsWith('Новый') || user.name === 'Пользователь Open-Key')) {
         user.name = cleanName;
       }
       if (cleanAddress) user.address = cleanAddress;
-      user.role = isOwnerIdentity(user.phone, user.accountId) || ownerMatch ? 'admin' : 'user';
+      const isNowOwner = isOwnerIdentity(cleanPhone, user.subscriberId, user.phoneHash) || ownerMatch;
+      user.role = isNowOwner ? 'admin' : 'user';
+      if (isNowOwner && user.status === 'blocked') {
+        user.status = 'active';
+      }
       user.lastSeenAt = now;
     }
 
@@ -4278,12 +4625,16 @@ async function startServer() {
       });
       return false;
     }
+    const ctx = extractContext(req);
     const user = upsertBillingUserFromIdentity({
       phone: verified.phone,
       accountId: verified.accountId,
       subscriberId: verified.subscriberId,
+      deviceId: extractDeviceIdFromCtx(ctx),
+      deviceLabel: extractDeviceLabelFromCtx(ctx),
       name: verified.name,
     });
+    rememberUserDomruSession(user.userId, ctx);
     if (user.status === 'expired' || user.status === 'blocked') {
       res.status(402).json({
         error: 'subscription_required',
@@ -4299,7 +4650,7 @@ async function startServer() {
   }
 
   function buildDemoBillingPayload(): {
-    user: ServerBillingUser;
+    user: ReturnType<typeof sanitizeBillingUserForClient>;
     transactions: ServerBillingTx[];
     config: ReturnType<typeof getPublicBillingConfig>;
   } {
@@ -4307,8 +4658,9 @@ async function startServer() {
     return {
       user: {
         userId: 'demo_subscriber',
-        phone: '79000000000',
+        phone: '',
         accountId: 'DEMO',
+        canFetchDomruData: false,
         name: 'Демо-режим',
         address: 'Демонстрационный объект',
         role: 'user',
@@ -4370,12 +4722,17 @@ async function startServer() {
     const npdTaxRub = Number((revenueLast30DaysRub * taxRate).toFixed(2));
     const netIncomeRub = Number((revenueLast30DaysRub - npdTaxRub).toFixed(2));
 
-    const sortedUsers = [...billingStore.users].sort((a, b) => b.lastSeenAt - a.lastSeenAt);
-    const sortedTxs = [...billingStore.transactions].sort((a, b) => b.createdAt - a.createdAt);
+    const sortedUsers = [...billingStore.users]
+      .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+      .map(sanitizeBillingUserForClient);
+    const sortedTxs = [...billingStore.transactions]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, 200)
+      .map(sanitizeBillingTxForClient);
 
     return {
       users: sortedUsers,
-      transactions: sortedTxs.slice(0, 200),
+      transactions: sortedTxs,
       config: getPublicBillingConfig(),
       stats: {
         totalUsers: billingStore.users.length,
@@ -4397,7 +4754,7 @@ async function startServer() {
     if (!verified.authenticated || !verified.isOwner) {
       res.status(403).json({
         error: 'forbidden_owner_only',
-        message: 'Доступ к админ-панели разрешён только владельцу сервиса (Л/С 450005579792)',
+        message: 'Доступ к админ-панели разрешён только владельцу сервиса',
       });
       return false;
     }
@@ -4439,14 +4796,17 @@ async function startServer() {
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
         address,
       });
+      rememberUserDomruSession(user.userId, ctx);
 
-      if (!user.phone && bodyPhone) {
+      if (!user.phoneHash && bodyPhone) {
         const cleanBodyPhone = normalizePhone(String(bodyPhone));
         if (cleanBodyPhone && !getOwnerPhonesSet().has(cleanBodyPhone)) {
-          user.phone = cleanBodyPhone;
+          user.phoneHash = hashPhone(cleanBodyPhone);
           cacheVerifiedSession(ctx.accessToken, { phone: cleanBodyPhone });
           saveBillingStoreToDisk();
         }
@@ -4455,10 +4815,11 @@ async function startServer() {
       const userTxs = billingStore.transactions
         .filter((t) => t.userId === user.userId)
         .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, 50);
+        .slice(0, 50)
+        .map(sanitizeBillingTxForClient);
 
       res.json({
-        user,
+        user: sanitizeBillingUserForClient(user),
         transactions: userTxs,
         config: getPublicBillingConfig(),
       });
@@ -4480,10 +4841,13 @@ async function startServer() {
       }
 
       const { amountRub, comment, address } = req.body || {};
+      const ctx = extractContext(req);
       const user = upsertBillingUserFromIdentity({
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
         address,
       });
@@ -4527,13 +4891,12 @@ async function startServer() {
 
         const ykPayment = await createYookassaPayment({
           amountRub: amount,
-          description: `Пополнение баланса Open-Key (Л/С ${user.accountId || user.phone || user.userId})`,
+          description: `Пополнение баланса Open-Key (Л/С ${user.accountId || user.userId})`,
           returnUrl,
           metadata: {
             txId,
             userId: user.userId,
             accountId: user.accountId || '',
-            phone: user.phone || '',
           },
         });
 
@@ -4549,14 +4912,15 @@ async function startServer() {
       const userTxs = billingStore.transactions
         .filter((t) => t.userId === user.userId)
         .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, 50);
+        .slice(0, 50)
+        .map(sanitizeBillingTxForClient);
 
       res.json({
         ok: true,
         mode: tx.confirmationUrl ? 'yookassa_redirect' : 'manual_fallback',
         confirmationUrl: tx.confirmationUrl,
-        transaction: tx,
-        user,
+        transaction: sanitizeBillingTxForClient(tx),
+        user: sanitizeBillingUserForClient(user),
         transactions: userTxs,
         config: getPublicBillingConfig(),
       });
@@ -4615,10 +4979,13 @@ async function startServer() {
         return;
       }
 
+      const ctx = extractContext(req);
       const user = upsertBillingUserFromIdentity({
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
       });
 
@@ -4650,12 +5017,13 @@ async function startServer() {
       const userTxs = billingStore.transactions
         .filter((t) => t.userId === user.userId)
         .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, 50);
+        .slice(0, 50)
+        .map(sanitizeBillingTxForClient);
 
       res.json({
         ok: true,
         updatedCount,
-        user,
+        user: sanitizeBillingUserForClient(user),
         transactions: userTxs,
         config: getPublicBillingConfig(),
       });
@@ -4679,10 +5047,13 @@ async function startServer() {
       }
 
       const { address, amountRub, comment, paymentChannel } = req.body || {};
+      const ctx = extractContext(req);
       const user = upsertBillingUserFromIdentity({
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
         address,
       });
@@ -4713,12 +5084,13 @@ async function startServer() {
       const userTxs = billingStore.transactions
         .filter((t) => t.userId === user.userId)
         .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, 50);
+        .slice(0, 50)
+        .map(sanitizeBillingTxForClient);
 
       res.json({
         ok: true,
-        transaction: tx,
-        user,
+        transaction: sanitizeBillingTxForClient(tx),
+        user: sanitizeBillingUserForClient(user),
         transactions: userTxs,
         config: getPublicBillingConfig(),
       });
@@ -4739,10 +5111,13 @@ async function startServer() {
       }
 
       const { address } = req.body || {};
+      const ctx = extractContext(req);
       const user = upsertBillingUserFromIdentity({
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
         address,
       });
@@ -4784,10 +5159,11 @@ async function startServer() {
       const userTxs = billingStore.transactions
         .filter((t) => t.userId === user.userId)
         .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, 50);
+        .slice(0, 50)
+        .map(sanitizeBillingTxForClient);
 
       res.json({
-        user,
+        user: sanitizeBillingUserForClient(user),
         transactions: userTxs,
         config: getPublicBillingConfig(),
       });
@@ -4808,10 +5184,13 @@ async function startServer() {
       }
 
       const { autoRenew } = req.body || {};
+      const ctx = extractContext(req);
       const user = upsertBillingUserFromIdentity({
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
       });
       user.autoRenew = Boolean(autoRenew);
@@ -4821,10 +5200,11 @@ async function startServer() {
       const userTxs = billingStore.transactions
         .filter((t) => t.userId === user.userId)
         .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, 50);
+        .slice(0, 50)
+        .map(sanitizeBillingTxForClient);
 
       res.json({
-        user,
+        user: sanitizeBillingUserForClient(user),
         transactions: userTxs,
         config: getPublicBillingConfig(),
       });
@@ -4869,26 +5249,28 @@ async function startServer() {
         return;
       }
 
+      const cleanPhoneHash = cleanPhone ? hashPhone(cleanPhone) : '';
       const existing = billingStore.users.find(
-        (u) =>
-          (cleanPhone && u.phone === cleanPhone) ||
-          (cleanAccountId && u.accountId === cleanAccountId)
+        (u) => cleanPhoneHash && u.phoneHash === cleanPhoneHash
       );
       if (existing) {
-        res.status(409).json({ error: 'user_exists', message: 'Пользователь с таким телефоном или Л/С уже есть в базе' });
+        res.status(409).json({ error: 'user_exists', message: 'Пользователь с таким телефоном уже есть в базе' });
         return;
       }
 
       const now = Date.now();
       const initBalance = Number.isFinite(Number(balanceRub)) ? Math.round(Number(balanceRub) * 100) / 100 : 0;
-      const userId = cleanPhone ? `usr_${cleanPhone}` : `usr_${crypto.randomBytes(5).toString('hex')}`;
+      const userId = cleanPhoneHash
+        ? `usr_${cleanPhoneHash.slice(0, 12)}`
+        : `usr_${crypto.randomBytes(5).toString('hex')}`;
       const newUser: ServerBillingUser = {
         userId,
-        phone: cleanPhone,
+        phone: '',
+        phoneHash: cleanPhoneHash,
         accountId: cleanAccountId,
-        name: cleanName || `Абонент +${cleanPhone}`,
+        name: cleanName || 'Пользователь Open-Key',
         address: String(address || '').trim(),
-        role: isOwnerIdentity(cleanPhone, cleanAccountId) || role === 'admin' ? 'admin' : 'user',
+        role: isOwnerIdentity(cleanPhone, '', cleanPhoneHash) || role === 'admin' ? 'admin' : 'user',
         balanceRub: initBalance,
         status: status === 'active' || status === 'expired' || status === 'blocked' ? status : 'trial',
         autoRenew: true,
@@ -4904,7 +5286,7 @@ async function startServer() {
           id: `tx_${crypto.randomBytes(6).toString('hex')}`,
           userId: newUser.userId,
           userName: newUser.name,
-          userPhone: newUser.phone,
+          userPhone: '',
           type: 'topup',
           status: 'completed',
           amountRub: initBalance,
@@ -5006,7 +5388,7 @@ async function startServer() {
         }
       }
       if (role === 'admin' || role === 'user') {
-        user.role = isOwnerIdentity(user.phone, user.accountId) ? 'admin' : role;
+        user.role = isOwnerIdentity(user.phone, user.subscriberId, user.phoneHash) ? 'admin' : role;
       }
       if (typeof autoRenew === 'boolean') {
         user.autoRenew = autoRenew;
@@ -5019,6 +5401,183 @@ async function startServer() {
       res.json(buildAdminOverviewPayload());
     } catch (err: any) {
       res.status(500).json({ error: 'sub_update_error', message: err?.message || 'Ошибка обновления пользователя' });
+    }
+  });
+
+  // On-demand live lookup of user data via Dom.ru API (phone numbers are never stored in plaintext)
+  app.post('/api/eg/admin/users/:userId/fetch-domru', async (req: Request, res: Response) => {
+    if (!(await verifyAdminRequest(req, res))) return;
+    try {
+      const userId = String(req.params.userId || '');
+      const user = billingStore.users.find((u) => u.userId === userId);
+      if (!user) {
+        res.status(404).json({ error: 'user_not_found', message: 'Пользователь не найден' });
+        return;
+      }
+
+      const storedSess = userDomruSessionMap.get(userId);
+      const fallbackAdminCtx =
+        !storedSess && isOwnerIdentity(user.phone, user.subscriberId, user.phoneHash)
+          ? extractContext(req)
+          : null;
+
+      const targetCtx: EgRequestContext | null = storedSess
+        ? {
+            accessToken: storedSess.accessToken,
+            operatorId: storedSess.operatorId || '1',
+            userAgent: storedSess.userAgent || createDefaultUserAgent(),
+            hasExplicitUuid: true,
+          }
+        : fallbackAdminCtx && fallbackAdminCtx.accessToken
+          ? fallbackAdminCtx
+          : null;
+
+      if (!targetCtx || !targetCtx.accessToken) {
+        res.json({
+          ok: false,
+          expired: true,
+          message:
+            'Активная сессия Дом.ру для этого пользователя пока не зафиксирована. Данные появятся после входа пользователя в приложение.',
+        });
+        return;
+      }
+
+      const profRes = await egFetch('/rest/v1/subscribers/profiles', targetCtx);
+      const placesRes = await egFetch('/rest/v3/subscriber-places', targetCtx);
+
+      if (profRes.status === 401 && placesRes.status === 401) {
+        res.json({
+          ok: false,
+          expired: true,
+          message: 'Токен Дом.ру пользователя истёк (401). Попросите пользователя повторно войти в приложение.',
+        });
+        return;
+      }
+
+      const profRoot = profRes.data?.data || profRes.data || {};
+      const subObj = profRoot?.subscriber || {};
+      const profSubId =
+        subObj.id != null
+          ? String(subObj.id)
+          : profRoot.subscriberId != null
+            ? String(profRoot.subscriberId)
+            : user.subscriberId || '';
+
+      const rawPlaces: any[] = Array.isArray(placesRes.data?.data) ? placesRes.data.data : [];
+      const firstPlace = rawPlaces[0] || null;
+      const firstPlaceId = firstPlace?.place?.id != null ? String(firstPlace.place.id) : '';
+
+      let phoneFromApi: string | null = null;
+      let loginFromApi: string | null = null;
+
+      const pickPhone = (obj: any): string | null => {
+        if (!obj || typeof obj !== 'object') return null;
+        const cand =
+          obj.phone ||
+          obj.phoneNumber ||
+          obj.msisdn ||
+          obj.contactPhone ||
+          '';
+        const norm = cand ? normalizePhone(String(cand)) : '';
+        return norm || null;
+      };
+
+      const subscriberPhonesArr: string[] = Array.from(
+        new Set(
+          (Array.isArray(profRoot?.subscriberPhones) ? profRoot.subscriberPhones : [])
+            .filter((p: any) => p?.number)
+            .sort(
+              (a: any, b: any) =>
+                (b?.numberValid !== false ? 1 : 0) - (a?.numberValid !== false ? 1 : 0)
+            )
+            .map((p: any) => normalizePhone(String(p.number)))
+            .filter(Boolean)
+        )
+      );
+
+      phoneFromApi =
+        pickPhone(subObj) || pickPhone(profRoot) || subscriberPhonesArr[0] || null;
+      if (subObj.login && String(subObj.login).trim()) {
+        loginFromApi = String(subObj.login).trim();
+      }
+
+      let balance: number | null = null;
+      let company: string | null = null;
+      let blocked: boolean | null = null;
+
+      if (firstPlaceId) {
+        try {
+          const finRes = await egFetch(
+            `/rest/v1/places/${encodeURIComponent(firstPlaceId)}/finances`,
+            targetCtx,
+            { placeIdOverride: firstPlaceId }
+          );
+          if (finRes.ok && finRes.data?.data) {
+            const fin = finRes.data.data;
+            balance = typeof fin.balance === 'number' ? fin.balance : null;
+            company = fin.company ? String(fin.company) : null;
+            blocked = typeof fin.blocked === 'boolean' ? fin.blocked : null;
+          }
+        } catch {
+          // non-fatal
+        }
+      }
+
+      if (!phoneFromApi && firstPlace?.subscriber) {
+        const spSub = firstPlace.subscriber;
+        if (!profSubId || String(spSub.id ?? spSub.subscriberId ?? '') === profSubId) {
+          phoneFromApi = pickPhone(spSub);
+          if (!loginFromApi && spSub.login) {
+            loginFromApi = String(spSub.login).trim();
+          }
+        }
+      }
+
+      const mappedPlaces = rawPlaces.map((sp: any) => ({
+        placeId: sp?.place?.id != null ? String(sp.place.id) : '',
+        address:
+          sp?.place?.address?.visibleAddress ||
+          sp?.place?.address?.groupName ||
+          'Адрес не указан',
+        accountId: String(
+          sp?.subscriber?.accountId || sp?.place?.accountId || ''
+        ).trim(),
+        subscriberType: sp?.subscriberType ? String(sp.subscriberType) : null,
+        subscriberState: sp?.subscriberState ? String(sp.subscriberState) : null,
+      }));
+
+      const liveName = String(subObj.name || profRoot.name || user.name || '').trim();
+      const liveAccId = String(
+        subObj.accountId || profRoot.accountId || mappedPlaces[0]?.accountId || user.accountId || ''
+      ).trim();
+
+      res.json({
+        ok: true,
+        domruProfile: {
+          userId: user.userId,
+          fetchedAt: Date.now(),
+          name: liveName,
+          phone: phoneFromApi,
+          phones: subscriberPhonesArr,
+          login: loginFromApi,
+          subscriberId: profSubId,
+          accountId: liveAccId,
+          subscriberType: firstPlace?.subscriberType ? String(firstPlace.subscriberType) : null,
+          subscriberState: firstPlace?.subscriberState ? String(firstPlace.subscriberState) : null,
+          balance,
+          company,
+          blocked,
+          places: mappedPlaces,
+          sourceNote: phoneFromApi
+            ? 'Данные получены напрямую из API Дом.ру (subscriberPhones) в момент запроса и не сохраняются на сервере.'
+            : 'Данные получены из API Дом.ру (номер телефона не указан в профиле абонента).',
+        },
+      });
+    } catch (err: any) {
+      res.status(502).json({
+        error: 'domru_fetch_error',
+        message: err?.message || 'Ошибка запроса данных пользователя через API Дом.ру',
+      });
     }
   });
 
@@ -5147,10 +5706,13 @@ async function startServer() {
         res.status(401).json({ error: 'unauthorized', message: 'Требуется авторизация' });
         return;
       }
+      const ctx = extractContext(req);
       const user = upsertBillingUserFromIdentity({
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
       });
       res.json({ aliases: getCameraAliasesForUser(user.userId) });
@@ -5184,10 +5746,13 @@ async function startServer() {
         return;
       }
       if (!(await assertActiveSubscription(req, res))) return;
+      const ctx = extractContext(req);
       const user = upsertBillingUserFromIdentity({
         phone: verified.phone,
         accountId: verified.accountId,
         subscriberId: verified.subscriberId,
+        deviceId: extractDeviceIdFromCtx(ctx),
+        deviceLabel: extractDeviceLabelFromCtx(ctx),
         name: verified.name,
       });
       const result = setCameraAliasForUser(user.userId, cleanId, String(name || ''));

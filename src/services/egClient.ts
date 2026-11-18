@@ -1,4 +1,5 @@
 import {
+  AdminDomruUserProfile,
   AdminOverviewPayload,
   AutoAccessConfig,
   AutoAccessPipelineReport,
@@ -1866,6 +1867,27 @@ export async function apiAdminUpdateUserSubscription(
   const data = await res.json();
   if (!res.ok) {
     throw new Error(data?.message || 'Ошибка обновления пользователя');
+  }
+  return data;
+}
+
+export async function apiAdminFetchUserDomruData(
+  session: EgSession,
+  userId: string,
+  adminPin?: string
+): Promise<{
+  ok: boolean;
+  expired?: boolean;
+  message?: string;
+  domruProfile?: AdminDomruUserProfile;
+}> {
+  const res = await fetch(`/api/eg/admin/users/${encodeURIComponent(userId)}/fetch-domru`, {
+    method: 'POST',
+    headers: buildAdminHeaders(session, adminPin),
+  });
+  const data = await res.json();
+  if (!res.ok && !data?.expired) {
+    throw new Error(data?.message || 'Ошибка запроса данных через API Дом.ру');
   }
   return data;
 }
