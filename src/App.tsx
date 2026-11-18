@@ -2220,7 +2220,7 @@ export default function App() {
         )}
 
         {/* Main Workspace Container */}
-        <main className="flex-1 max-w-6xl w-full mx-auto px-3 sm:px-8 py-4 sm:py-7">
+        <main className="flex-1 max-w-6xl w-full mx-auto px-3 sm:px-8 pt-2.5 pb-4 md:py-7">
           {isSubscriptionRestricted && activeSection !== 'settings' && activeSection !== 'about' && activeSection !== 'admin' && (
             <div className="mb-4 sm:mb-6 p-3 sm:p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/35 border border-amber-300/70 dark:border-amber-500/35 flex flex-wrap items-center justify-between gap-2.5 sm:gap-4 text-xs text-amber-900 dark:text-amber-100">
               <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">

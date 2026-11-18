@@ -536,9 +536,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* =================================================================== */}
-      {/* TOP BAR: Title, Address Context & Compact Real KPI Strip            */}
+      {/* TOP BAR: Title, Address Context & Compact Real KPI Strip (Desktop)  */}
       {/* =================================================================== */}
-      <div className="flex flex-col md:flex-row md:items-end justify-between gap-3 sm:gap-4">
+      <div className="hidden md:flex md:items-end justify-between gap-4">
         <div className="space-y-0.5 sm:space-y-1 min-w-0">
           <h1 className="text-xl sm:text-[28px] font-bold tracking-tight text-slate-900 dark:text-white font-display">
             Обзор
