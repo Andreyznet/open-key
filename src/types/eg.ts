@@ -449,3 +449,39 @@ export interface Esp32GateStatusPayload {
     deliveredAt: number | null;
   }>;
 }
+
+export type SubscriberAuditAction = 'login' | 'logout' | 'door_open';
+
+export interface SubscriberAuditLogEntry {
+  id: string;
+  userId: string;
+  userName: string;
+  accountId?: string;
+  subscriberId?: string;
+  address?: string;
+  deviceLabel?: string;
+  deviceId?: string;
+  ipAddress?: string;
+  action: SubscriberAuditAction;
+  status: 'success' | 'denied' | 'error';
+  authMethod?: 'password' | 'sms' | 'token' | 'manual' | 'session_expired';
+  targetName?: string;
+  targetKind?: 'door' | 'gate' | 'guest_pass';
+  placeId?: string;
+  accessControlId?: string;
+  entranceId?: string | null;
+  details: string;
+  timestamp: number;
+}
+
+export interface AdminSubscriberLogsPayload {
+  logs: SubscriberAuditLogEntry[];
+  stats: {
+    total: number;
+    logins: number;
+    logouts: number;
+    doorOpens: number;
+    deniedOrErrors: number;
+  };
+}
+

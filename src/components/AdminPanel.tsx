@@ -1,18 +1,26 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   Ban,
   CalendarPlus,
   Check,
   CheckCircle2,
   Clock,
+  Copy,
+  Cpu,
+  DoorOpen,
   FileCheck2,
+  History,
   Lock,
+  LogIn,
+  LogOut,
   Plus,
   Receipt,
   RefreshCw,
   Search,
   Settings2,
   ShieldCheck,
+  Trash2,
   Unlock,
   Users,
   UserSearch,
@@ -22,12 +30,17 @@ import {
 import {
   AdminDomruUserProfile,
   AdminOverviewPayload,
+  AdminSubscriberLogsPayload,
   BillingSubscriptionStatus,
   BillingUserRecord,
+  CameraItem,
   EgSession,
+  Esp32GateStatusPayload,
+  SubscriberAuditAction,
 } from '../types/eg';
 import {
   apiAdminAdjustBalance,
+  apiAdminClearLogs,
   apiAdminCreateUser,
   apiAdminFetchUserDomruData,
   apiAdminIssueNpdReceipt,
@@ -35,16 +48,21 @@ import {
   apiAdminUnlock,
   apiAdminUpdateConfig,
   apiAdminUpdateUserSubscription,
+  apiGetAdminLogs,
   apiGetAdminOverview,
+  apiGetEsp32Status,
+  apiUpdateEsp32Config,
 } from '../services/egClient';
 
 interface AdminPanelProps {
   session: EgSession;
+  cameras?: CameraItem[];
   onNotice: (msg: string) => void;
   onBillingUpdated: () => void;
+  onSyncRequested?: () => Promise<void> | void;
 }
 
-type AdminSubTab = 'users' | 'transactions' | 'config';
+type AdminSubTab = 'users' | 'logs' | 'transactions' | 'config' | 'esp32';
 
 const ADMIN_PIN_STORAGE_KEY = 'domru_lab_admin_pin_v1';
 
@@ -68,6 +86,20 @@ function formatDateTime(ms: number | null | undefined): string {
     month: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+  });
+}
+
+function formatDateTimeSec(ms: number | null | undefined): string {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleString('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
   });
 }
 
@@ -117,8 +149,10 @@ function renderStatusLabel(user: BillingUserRecord): {
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({
   session,
+  cameras = [],
   onNotice,
   onBillingUpdated,
+  onSyncRequested,
 }) => {
   const [adminPin, setAdminPin] = useState<string>(() => {
     try {
@@ -177,6 +211,70 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [cfgSellerCity, setCfgSellerCity] = useState<string>('');
   const [cfgNewPin, setCfgNewPin] = useState<string>('');
 
+  // Admin-only ESP32 controller state
+  const [esp32Status, setEsp32Status] = useState<Esp32GateStatusPayload | null>(null);
+  const [esp32SketchOpen, setEsp32SketchOpen] = useState<boolean>(false);
+  const [esp32Saving, setEsp32Saving] = useState<boolean>(false);
+  const [esp32HttpUrlInput, setEsp32HttpUrlInput] = useState<string>('');
+  const [esp32PulseMsInput, setEsp32PulseMsInput] = useState<string>('600');
+  const [esp32Ch1PinInput, setEsp32Ch1PinInput] = useState<string>('18');
+  const [esp32Ch2PinInput, setEsp32Ch2PinInput] = useState<string>('19');
+  const [esp32Gate1CamIdInput, setEsp32Gate1CamIdInput] = useState<string>('');
+  const [esp32Gate2CamIdInput, setEsp32Gate2CamIdInput] = useState<string>('');
+  const [esp32SecretInput, setEsp32SecretInput] = useState<string>('');
+
+  // Subscriber Audit Logs state
+  const [logsPayload, setLogsPayload] = useState<AdminSubscriberLogsPayload | null>(null);
+  const [logsLoading, setLogsLoading] = useState<boolean>(false);
+  const [logActionFilter, setLogActionFilter] = useState<'all' | SubscriberAuditAction>('all');
+  const [logUserFilter, setLogUserFilter] = useState<string>('');
+  const [logSearch, setLogSearch] = useState<string>('');
+  const [confirmClearLogs, setConfirmClearLogs] = useState<boolean>(false);
+  const [clearingLogs, setClearingLogs] = useState<boolean>(false);
+
+  const loadEsp32Status = useCallback(async () => {
+    try {
+      const st = await apiGetEsp32Status(session);
+      setEsp32Status(st);
+      if (st?.config) {
+        setEsp32HttpUrlInput(st.config.gate1HttpUrl || '');
+        setEsp32PulseMsInput(String(st.config.pulseDurationMs || 600));
+        setEsp32Ch1PinInput(String(st.config.gpioGate1Pin || 18));
+        setEsp32Ch2PinInput(String(st.config.gpioGate2Pin || 19));
+        setEsp32Gate1CamIdInput(st.config.gate1CameraId || '');
+        setEsp32Gate2CamIdInput(st.config.gate2CameraId || '');
+        setEsp32SecretInput(st.config.deviceToken || '');
+      }
+    } catch {
+      // non-fatal
+    }
+  }, [session]);
+
+  const loadSubscriberLogs = useCallback(
+    async (pinOverride?: string) => {
+      setLogsLoading(true);
+      try {
+        const activePin = pinOverride !== undefined ? pinOverride : adminPin;
+        const data = await apiGetAdminLogs(
+          session,
+          {
+            action: logActionFilter,
+            userId: logUserFilter || undefined,
+            search: logSearch.trim() || undefined,
+            limit: 400,
+          },
+          activePin
+        );
+        setLogsPayload(data);
+      } catch {
+        // non-fatal if PIN not yet entered
+      } finally {
+        setLogsLoading(false);
+      }
+    },
+    [session, adminPin, logActionFilter, logUserFilter, logSearch]
+  );
+
   const loadOverview = useCallback(
     async (pinOverride?: string) => {
       setLoading(true);
@@ -212,7 +310,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
   useEffect(() => {
     loadOverview();
-  }, [loadOverview]);
+    loadEsp32Status();
+  }, [loadOverview, loadEsp32Status]);
+
+  useEffect(() => {
+    if (!pinRequired) {
+      loadSubscriberLogs();
+    }
+  }, [pinRequired, loadSubscriberLogs]);
 
   const handleUnlockPin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -521,11 +626,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => loadOverview()}
-            disabled={loading}
+            onClick={() => {
+              loadOverview();
+              loadSubscriberLogs();
+            }}
+            disabled={loading || logsLoading}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white dark:bg-[#1a202c] border border-slate-200 dark:border-white/[0.08] text-xs font-semibold text-slate-700 dark:text-slate-200 cursor-pointer"
           >
-            <RefreshCw className={`w-3.5 h-3.5 text-[#2563EB] dark:text-[#3B82F6] ${loading ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-3.5 h-3.5 text-[#2563EB] dark:text-[#3B82F6] ${loading || logsLoading ? 'animate-spin' : ''}`} />
             <span>Обновить</span>
           </button>
         </div>
@@ -660,8 +768,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
           {(
             [
               { id: 'users', label: 'Пользователи и балансы', icon: <Users className="w-3.5 h-3.5" /> },
+              {
+                id: 'logs',
+                label: logsPayload ? `Логи абонентов (${logsPayload.stats.total})` : 'Логи абонентов',
+                icon: <History className="w-3.5 h-3.5" />,
+              },
               { id: 'transactions', label: 'Платежи и чеки НПД', icon: <Receipt className="w-3.5 h-3.5" /> },
               { id: 'config', label: 'Тариф и самозанятость', icon: <Settings2 className="w-3.5 h-3.5" /> },
+              { id: 'esp32', label: 'Контроллер ESP32', icon: <Cpu className="w-3.5 h-3.5" /> },
             ] as const
           ).map((tab) => (
             <button
@@ -873,6 +987,20 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
                         {/* Row Actions */}
                         <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setLogUserFilter(user.userId);
+                              setLogActionFilter('all');
+                              setSubTab('logs');
+                            }}
+                            title="Открыть журнал входов, выходов и открытий дверей этого абонента"
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200/80 dark:bg-white/[0.06] dark:hover:bg-white/[0.1] text-slate-700 dark:text-slate-200 font-medium inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <History className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+                            <span>Логи</span>
+                          </button>
+
                           <button
                             type="button"
                             disabled={isFetchingDomru}
@@ -1459,6 +1587,531 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </ul>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ================================================================= */}
+      {/* TAB: SUBSCRIBER AUDIT LOGS                                        */}
+      {/* ================================================================= */}
+      {subTab === 'logs' && (
+        <div className="space-y-4">
+          {/* Summary Stats */}
+          {logsPayload && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="p-4 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06]">
+                <div className="text-[11px] font-medium text-slate-400">Всего событий</div>
+                <div className="text-xl font-bold text-slate-900 dark:text-white font-mono tabular-nums mt-0.5">
+                  {logsPayload.stats.total}
+                </div>
+              </div>
+              <div className="p-4 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06]">
+                <div className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>Входы</span>
+                </div>
+                <div className="text-xl font-bold text-slate-900 dark:text-white font-mono tabular-nums mt-0.5">
+                  {logsPayload.stats.logins}
+                </div>
+              </div>
+              <div className="p-4 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06]">
+                <div className="text-[11px] font-medium text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>Выходы</span>
+                </div>
+                <div className="text-xl font-bold text-slate-900 dark:text-white font-mono tabular-nums mt-0.5">
+                  {logsPayload.stats.logouts}
+                </div>
+              </div>
+              <div className="p-4 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06]">
+                <div className="text-[11px] font-medium text-[#2563EB] dark:text-[#3B82F6] flex items-center gap-1">
+                  <DoorOpen className="w-3.5 h-3.5" />
+                  <span>Открытия дверей</span>
+                </div>
+                <div className="text-xl font-bold text-slate-900 dark:text-white font-mono tabular-nums mt-0.5">
+                  {logsPayload.stats.doorOpens}
+                  {logsPayload.stats.deniedOrErrors > 0 && (
+                    <span className="ml-2 text-[11px] font-semibold text-rose-500">
+                      ({logsPayload.stats.deniedOrErrors} отказ.)
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Filters */}
+          <div className="flex flex-wrap items-center gap-2.5 p-4 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06]">
+            <div className="relative flex-1 min-w-[200px]">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={logSearch}
+                onChange={(e) => setLogSearch(e.target.value)}
+                placeholder="Поиск по имени, адресу, двери, устройству, IP..."
+                className="w-full pl-8 pr-3 py-1.5 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#2563EB]/30"
+              />
+            </div>
+
+            <select
+              value={logUserFilter}
+              onChange={(e) => setLogUserFilter(e.target.value)}
+              className="px-3 py-1.5 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10 text-slate-800 dark:text-slate-100 focus:outline-none"
+            >
+              <option value="">Все абоненты</option>
+              {overview?.users.map((u) => (
+                <option key={u.userId} value={u.userId}>
+                  {u.name} {u.address ? `(${u.address})` : ''}
+                </option>
+              ))}
+            </select>
+
+            <div className="flex flex-wrap items-center gap-1">
+              {(
+                [
+                  { id: 'all', label: 'Все' },
+                  { id: 'login', label: 'Вход' },
+                  { id: 'logout', label: 'Выход' },
+                  { id: 'door_open', label: 'Открытия дверей' },
+                ] as const
+              ).map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setLogActionFilter(f.id)}
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-colors cursor-pointer ${
+                    logActionFilter === f.id
+                      ? 'bg-[#2563EB] text-white'
+                      : 'bg-slate-100 dark:bg-white/[0.06] text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+
+            {confirmClearLogs ? (
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={clearingLogs}
+                  onClick={async () => {
+                    setClearingLogs(true);
+                    try {
+                      const cleared = await apiAdminClearLogs(session, adminPin);
+                      setLogsPayload(cleared);
+                      setConfirmClearLogs(false);
+                      onNotice('Журнал действий абонентов очищен');
+                    } catch (err: any) {
+                      onNotice(err?.message || 'Ошибка очистки логов');
+                    } finally {
+                      setClearingLogs(false);
+                    }
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-semibold cursor-pointer"
+                >
+                  {clearingLogs ? 'Очистка...' : 'Подтвердить'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmClearLogs(false)}
+                  className="px-2 py-1.5 rounded-lg bg-slate-100 dark:bg-white/[0.06] text-slate-600 dark:text-slate-300 text-[11px] cursor-pointer"
+                >
+                  Отмена
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                disabled={!logsPayload || logsPayload.stats.total === 0}
+                onClick={() => setConfirmClearLogs(true)}
+                className="px-2.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-40 text-rose-500 text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Очистить</span>
+              </button>
+            )}
+          </div>
+
+          {/* Log Feed */}
+          <div className="rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06] overflow-hidden">
+            {logsLoading && !logsPayload ? (
+              <div className="p-10 text-center text-xs text-slate-400">Загрузка логов...</div>
+            ) : !logsPayload || logsPayload.logs.length === 0 ? (
+              <div className="p-10 text-center text-xs text-slate-400">
+                Событий по выбранным фильтрам пока нет
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 dark:divide-white/[0.06]">
+                {logsPayload.logs.map((entry) => {
+                  const isDeniedOrError = entry.status !== 'success';
+                  const badge =
+                    entry.action === 'login'
+                      ? {
+                          label: 'Вход',
+                          cls: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+                          icon: <LogIn className="w-3.5 h-3.5" />,
+                        }
+                      : entry.action === 'logout'
+                        ? {
+                            label: entry.authMethod === 'session_expired' ? 'Выход (сессия)' : 'Выход',
+                            cls: 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
+                            icon: <LogOut className="w-3.5 h-3.5" />,
+                          }
+                        : isDeniedOrError
+                          ? {
+                              label: entry.status === 'denied' ? 'Отказ' : 'Ошибка',
+                              cls: 'bg-rose-500/10 text-rose-500',
+                              icon: <AlertTriangle className="w-3.5 h-3.5" />,
+                            }
+                          : {
+                              label: entry.targetKind === 'guest_pass' ? 'Гостевой вход' : 'Открытие',
+                              cls: 'bg-[#2563EB]/10 text-[#2563EB] dark:text-[#3B82F6]',
+                              icon: <DoorOpen className="w-3.5 h-3.5" />,
+                            };
+
+                  return (
+                    <div
+                      key={entry.id}
+                      className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs hover:bg-slate-50/70 dark:hover:bg-white/[0.02]"
+                    >
+                      <div className="flex items-start gap-3 min-w-0">
+                        <span
+                          className={`mt-0.5 px-2.5 py-1 rounded-lg font-semibold inline-flex items-center gap-1.5 shrink-0 ${badge.cls}`}
+                        >
+                          {badge.icon}
+                          <span>{badge.label}</span>
+                        </span>
+
+                        <div className="min-w-0 space-y-0.5">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                            <span className="font-semibold text-slate-900 dark:text-white">
+                              {entry.userName || 'Абонент'}
+                            </span>
+                            {entry.targetName && (
+                              <span className="text-slate-600 dark:text-slate-300 font-medium">
+                                → {entry.targetName}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                            {entry.details}
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-400">
+                            {entry.address && <span>{entry.address}</span>}
+                            {entry.accountId && <span className="font-mono">Л/С {entry.accountId}</span>}
+                            {entry.deviceLabel && <span className="font-mono">{entry.deviceLabel}</span>}
+                            {entry.ipAddress && <span className="font-mono">IP {entry.ipAddress}</span>}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="text-[11px] text-slate-400 font-mono tabular-nums shrink-0 sm:text-right pl-9 sm:pl-0">
+                        {formatDateTimeSec(entry.timestamp)}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ================================================================= */}
+      {/* TAB 4: ESP32 GATE CONTROLLER (ADMIN-ONLY)                         */}
+      {/* ================================================================= */}
+      {subTab === 'esp32' && (
+        <div className="p-6 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06] space-y-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2.5">
+                <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                  Контроллер ворот ESP32
+                </h2>
+                <span
+                  className={`text-[11px] font-semibold px-2.5 py-0.5 rounded-md ${
+                    esp32Status?.lastPollAt && Date.now() - esp32Status.lastPollAt < 30000
+                      ? 'bg-emerald-500/15 text-emerald-500'
+                      : 'bg-[#2563EB]/10 text-[#2563EB] dark:text-[#3B82F6]'
+                  }`}
+                >
+                  {esp32Status?.lastPollAt && Date.now() - esp32Status.lastPollAt < 30000
+                    ? 'ESP32 на связи'
+                    : esp32Status?.config?.gate1HttpUrl
+                    ? 'Режим прямого HTTP'
+                    : 'Режим очереди команд (Polling)'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-3xl leading-relaxed">
+                Привязка каналов реле по уникальным ID камер Дом.ру. Нажмите «Открыть» на камере{' '}
+                <strong>
+                  «
+                  {cameras.find(
+                    (c) =>
+                      (esp32Status?.config?.gate1CameraId && c.id === esp32Status.config.gate1CameraId) ||
+                      c.entranceId === 'esp32_gate_1'
+                  )?.name || 'Камера фасад 1 - 3-Й Мкр 6 б'}
+                  »
+                </strong>{' '}
+                (Канал 1 · GPIO {esp32Status?.config?.gpioGate1Pin || 18}
+                {esp32Status?.config?.gate1CameraId ? ` · ID ${esp32Status.config.gate1CameraId}` : ''}) или{' '}
+                <strong>
+                  «
+                  {cameras.find(
+                    (c) =>
+                      (esp32Status?.config?.gate2CameraId && c.id === esp32Status.config.gate2CameraId) ||
+                      c.entranceId === 'esp32_gate_2'
+                  )?.name || 'Камера фасад 2 - 3-Й Мкр 6 б'}
+                  »
+                </strong>{' '}
+                (Канал 2 · GPIO {esp32Status?.config?.gpioGate2Pin || 19}
+                {esp32Status?.config?.gate2CameraId ? ` · ID ${esp32Status.config.gate2CameraId}` : ''}) — импульс{' '}
+                <span className="font-mono font-semibold">
+                  {esp32Status?.config?.pulseDurationMs || 600} мс
+                </span>. Пользователи не видят эти технические настройки.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={loadEsp32Status}
+                className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.1] text-xs font-medium text-slate-700 dark:text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Обновить</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setEsp32SketchOpen((v) => !v)}
+                className="px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.1] text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors cursor-pointer"
+              >
+                {esp32SketchOpen ? 'Скрыть прошивку ESP32' : 'Прошивка для ESP32'}
+              </button>
+            </div>
+          </div>
+
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (esp32Saving) return;
+              setEsp32Saving(true);
+              try {
+                const baseUrl = esp32HttpUrlInput.trim().replace(/\/+$/, '');
+                const updated = await apiUpdateEsp32Config(session, {
+                  gate1HttpUrl: baseUrl ? `${baseUrl}/open?channel=1` : '',
+                  gate2HttpUrl: baseUrl ? `${baseUrl}/open?channel=2` : '',
+                  pulseDurationMs: Number(esp32PulseMsInput) || 600,
+                  gpioGate1Pin: Number(esp32Ch1PinInput) || 18,
+                  gpioGate2Pin: Number(esp32Ch2PinInput) || 19,
+                  gate1CameraId: esp32Gate1CamIdInput.trim(),
+                  gate2CameraId: esp32Gate2CamIdInput.trim(),
+                  deviceToken: esp32SecretInput.trim(),
+                });
+                setEsp32Status(updated);
+                if (updated?.config) {
+                  setEsp32Gate1CamIdInput(updated.config.gate1CameraId || '');
+                  setEsp32Gate2CamIdInput(updated.config.gate2CameraId || '');
+                }
+                if (onSyncRequested) await onSyncRequested();
+                onNotice('Настройки контроллера ворот ESP32 сохранены');
+              } catch (err: any) {
+                onNotice(err?.message || 'Ошибка сохранения настроек ESP32');
+              } finally {
+                setEsp32Saving(false);
+              }
+            }}
+            className="pt-4 border-t border-slate-100 dark:border-white/[0.06] space-y-4"
+          >
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="block text-xs text-slate-400">
+                  Привязка «Ворота №1» по уникальному ID камеры Дом.ру
+                </label>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={cameras.some((c) => c.id === esp32Gate1CamIdInput) ? esp32Gate1CamIdInput : ''}
+                    onChange={(e) => {
+                      if (e.target.value) setEsp32Gate1CamIdInput(e.target.value);
+                    }}
+                    className="flex-1 min-w-0 px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                  >
+                    <option value="">Выбрать камеру из списка…</option>
+                    {cameras.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name} (ID {c.id})
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={esp32Gate1CamIdInput}
+                    onChange={(e) => setEsp32Gate1CamIdInput(e.target.value)}
+                    placeholder="ID камеры 1"
+                    className="w-32 px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="block text-xs text-slate-400">
+                  Привязка «Ворота №2» по уникальному ID камеры Дом.ру
+                </label>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={cameras.some((c) => c.id === esp32Gate2CamIdInput) ? esp32Gate2CamIdInput : ''}
+                    onChange={(e) => {
+                      if (e.target.value) setEsp32Gate2CamIdInput(e.target.value);
+                    }}
+                    className="flex-1 min-w-0 px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                  >
+                    <option value="">Выбрать камеру из списка…</option>
+                    {cameras.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name} (ID {c.id})
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={esp32Gate2CamIdInput}
+                    onChange={(e) => setEsp32Gate2CamIdInput(e.target.value)}
+                    placeholder="ID камеры 2"
+                    className="w-32 px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
+              <div className="space-y-1 sm:col-span-2">
+                <label className="block text-xs text-slate-400">
+                  HTTP-адрес ESP32 (необязательно при опросе VPS)
+                </label>
+                <input
+                  type="text"
+                  value={esp32HttpUrlInput}
+                  onChange={(e) => setEsp32HttpUrlInput(e.target.value)}
+                  placeholder="Например: http://192.168.1.55 (или пусто для Polling)"
+                  className="w-full px-3.5 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="block text-xs text-slate-400">Импульс (мс)</label>
+                <input
+                  type="number"
+                  min={150}
+                  max={3000}
+                  value={esp32PulseMsInput}
+                  onChange={(e) => setEsp32PulseMsInput(e.target.value)}
+                  className="w-full px-3.5 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <label className="block text-xs text-slate-400">GPIO Вор. 1</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={39}
+                    value={esp32Ch1PinInput}
+                    onChange={(e) => setEsp32Ch1PinInput(e.target.value)}
+                    className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-xs text-slate-400">GPIO Вор. 2</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={39}
+                    value={esp32Ch2PinInput}
+                    onChange={(e) => setEsp32Ch2PinInput(e.target.value)}
+                    className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                  />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={esp32Saving}
+                className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer"
+              >
+                {esp32Saving ? 'Сохранение...' : 'Сохранить ESP32'}
+              </button>
+            </div>
+          </form>
+
+          {esp32SketchOpen && (
+            <div className="pt-4 border-t border-slate-100 dark:border-white/[0.06] space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                  Готовый скетч Arduino IDE для ESP32 (опрос /api/eg/esp32/poll)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sketch = `// Open-Key ESP32 Gate Remote Relay Controller
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* SERVER_POLL_URL = "${typeof window !== 'undefined' ? window.location.origin : 'http://YOUR_VPS_IP:3000'}/api/eg/esp32/poll";
+
+const int PIN_GATE_1 = ${esp32Status?.config?.gpioGate1Pin || 18}; // Кнопка 1 пульта (Ворота 1)
+const int PIN_GATE_2 = ${esp32Status?.config?.gpioGate2Pin || 19}; // Кнопка 2 пульта (Ворота 2)
+const int PULSE_MS = ${esp32Status?.config?.pulseDurationMs || 600};
+
+void pressRemoteButton(int pin, int durationMs) {
+  digitalWrite(pin, HIGH);
+  delay(durationMs);
+  digitalWrite(pin, LOW);
+}
+
+void setup() {
+  pinMode(PIN_GATE_1, OUTPUT);
+  pinMode(PIN_GATE_2, OUTPUT);
+  digitalWrite(PIN_GATE_1, LOW);
+  digitalWrite(PIN_GATE_2, LOW);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(SERVER_POLL_URL);
+    if (http.GET() == 200) {
+      String body = http.getString();
+      if (body.indexOf("\\"channel\\":1") >= 0) pressRemoteButton(PIN_GATE_1, PULSE_MS);
+      if (body.indexOf("\\"channel\\":2") >= 0) pressRemoteButton(PIN_GATE_2, PULSE_MS);
+    }
+    http.end();
+  }
+  delay(700);
+}`;
+                    navigator.clipboard.writeText(sketch);
+                    onNotice('Код прошивки ESP32 скопирован в буфер обмена');
+                  }}
+                  className="px-3 py-1 rounded-lg bg-[#2563EB]/10 text-[#2563EB] dark:text-[#3B82F6] text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Скопировать скетч</span>
+                </button>
+              </div>
+              <pre className="p-3.5 rounded-xl bg-slate-900 text-slate-100 text-[11px] font-mono overflow-x-auto leading-relaxed">
+{`// Подключение пульта ворот к ESP32 через 2 оптопары PC817 или 2-канальное реле:
+// GPIO ${esp32Status?.config?.gpioGate1Pin || 18} -> Кнопка 1 на пульте (Ворота 1)
+// GPIO ${esp32Status?.config?.gpioGate2Pin || 19} -> Кнопка 2 на пульте (Ворота 2)
+// Эндпоинт опроса команд для ESP32: GET ${typeof window !== 'undefined' ? window.location.origin : ''}/api/eg/esp32/poll`}
+              </pre>
+            </div>
+          )}
         </div>
       )}
     </div>

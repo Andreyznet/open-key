@@ -1,6 +1,7 @@
 import {
   AdminDomruUserProfile,
   AdminOverviewPayload,
+  AdminSubscriberLogsPayload,
   AutoAccessConfig,
   AutoAccessPipelineReport,
   AutoAccessStatusPayload,
@@ -306,6 +307,26 @@ export async function apiVerifyToken(
   };
   saveSession(session);
   return session;
+}
+
+export async function apiLogout(
+  session: EgSession,
+  reason: 'manual' | 'session_expired' = 'manual'
+): Promise<void> {
+  if (!session || session.mode === 'demo') return;
+  try {
+    await fetch('/api/eg/auth/logout', {
+      method: 'POST',
+      headers: buildHeaders(session),
+      keepalive: true,
+      body: JSON.stringify({
+        reason,
+        ...buildBillingIdentity(session),
+      }),
+    });
+  } catch {
+    // Non-blocking logout notification
+  }
 }
 
 // --- Demo Stand Session & Data ---
@@ -767,7 +788,13 @@ export async function apiRenameCamera(
 
 export async function apiOpenLock(
   session: EgSession,
-  lock: { placeId: string; accessControlId: string; entranceId: string | null }
+  lock: {
+    placeId: string;
+    accessControlId: string;
+    entranceId: string | null;
+    lockName?: string;
+    placeAddress?: string;
+  }
 ): Promise<{ ok: boolean; timestamp: string }> {
   if (session.mode === 'demo') {
     await new Promise((r) => setTimeout(r, 320));
@@ -781,6 +808,8 @@ export async function apiOpenLock(
       placeId: lock.placeId,
       accessControlId: lock.accessControlId,
       entranceId: lock.entranceId,
+      lockName: lock.lockName,
+      placeAddress: lock.placeAddress,
     }),
   });
 
@@ -1986,3 +2015,46 @@ export async function apiUpdateEsp32Config(
   }
   return data;
 }
+
+export async function apiGetAdminLogs(
+  session: EgSession,
+  params?: {
+    action?: 'all' | 'login' | 'logout' | 'door_open';
+    userId?: string;
+    search?: string;
+    limit?: number;
+  },
+  adminPin?: string
+): Promise<AdminSubscriberLogsPayload> {
+  const qs = new URLSearchParams();
+  if (params?.action && params.action !== 'all') qs.set('action', params.action);
+  if (params?.userId) qs.set('userId', params.userId);
+  if (params?.search) qs.set('search', params.search);
+  if (params?.limit) qs.set('limit', String(params.limit));
+  const queryStr = qs.toString();
+  const res = await fetch(`/api/eg/admin/logs${queryStr ? `?${queryStr}` : ''}`, {
+    method: 'GET',
+    headers: buildAdminHeaders(session, adminPin),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.message || 'Ошибка загрузки логов абонентов');
+  }
+  return data;
+}
+
+export async function apiAdminClearLogs(
+  session: EgSession,
+  adminPin?: string
+): Promise<AdminSubscriberLogsPayload> {
+  const res = await fetch('/api/eg/admin/logs/clear', {
+    method: 'POST',
+    headers: buildAdminHeaders(session, adminPin),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.message || 'Ошибка очистки логов абонентов');
+  }
+  return data;
+}
+

@@ -44,7 +44,6 @@ import {
   DndItem,
   DoorActionLog,
   EgSession,
-  Esp32GateStatusPayload,
   GuestPassControlOption,
   HistoryEventItem,
   LockItem,
@@ -58,16 +57,15 @@ import {
   apiDeleteTempPass,
   apiGetBillingMe,
   apiGetCameraEvents,
-  apiGetEsp32Status,
   apiGetPlaceHistoryPage,
   apiGetTempPasses,
+  apiLogout,
   apiOpenLock,
   apiRenameCamera,
   apiRenewSubscription,
   apiSetBillingAutoRenew,
   apiSyncDashboard,
   apiUpdateDnd,
-  apiUpdateEsp32Config,
   downloadArchiveVideoMp4,
   loadLocalCameraAliases,
   loadSavedSession,
@@ -315,19 +313,6 @@ export default function App() {
       ? 'no_funds'
       : 'none';
 
-  // ESP32 Gate Remote Controller state
-  const [esp32Status, setEsp32Status] = useState<Esp32GateStatusPayload | null>(null);
-  const [esp32ConfigOpen, setEsp32ConfigOpen] = useState<boolean>(false);
-  const [esp32SketchOpen, setEsp32SketchOpen] = useState<boolean>(false);
-  const [esp32Saving, setEsp32Saving] = useState<boolean>(false);
-  const [esp32HttpUrlInput, setEsp32HttpUrlInput] = useState<string>('');
-  const [esp32PulseMsInput, setEsp32PulseMsInput] = useState<string>('600');
-  const [esp32Ch1PinInput, setEsp32Ch1PinInput] = useState<string>('18');
-  const [esp32Ch2PinInput, setEsp32Ch2PinInput] = useState<string>('19');
-  const [esp32Gate1CamIdInput, setEsp32Gate1CamIdInput] = useState<string>('');
-  const [esp32Gate2CamIdInput, setEsp32Gate2CamIdInput] = useState<string>('');
-  const [esp32SecretInput, setEsp32SecretInput] = useState<string>('');
-
   const showNotice = useCallback((msg: string) => {
     setToastNotice(msg);
   }, []);
@@ -395,23 +380,6 @@ export default function App() {
           // non-fatal
         });
 
-      apiGetEsp32Status(activeSession)
-        .then((st) => {
-          setEsp32Status(st);
-          if (st?.config) {
-            setEsp32HttpUrlInput(st.config.gate1HttpUrl || '');
-            setEsp32PulseMsInput(String(st.config.pulseDurationMs || 600));
-            setEsp32Ch1PinInput(String(st.config.gpioGate1Pin || 18));
-            setEsp32Ch2PinInput(String(st.config.gpioGate2Pin || 19));
-            setEsp32Gate1CamIdInput(st.config.gate1CameraId || '');
-            setEsp32Gate2CamIdInput(st.config.gate2CameraId || '');
-            setEsp32SecretInput(st.config.deviceToken || '');
-          }
-        })
-        .catch(() => {
-          setEsp32Status(null);
-        });
-
       const pIds = (data.places || []).map((p) => p.id).filter(Boolean);
       if (pIds.length > 0) {
         apiGetPlaceHistoryPage(activeSession, pIds, 0)
@@ -432,6 +400,7 @@ export default function App() {
       }
     } catch (err: any) {
       if (err?.message === 'UNAUTHORIZED') {
+        void apiLogout(activeSession, 'session_expired');
         saveSession(null);
         setSession(null);
       } else {
@@ -1139,6 +1108,8 @@ export default function App() {
           placeId: lock.placeId,
           accessControlId: lock.accessControlId,
           entranceId: lock.entranceId,
+          lockName: displayLockName,
+          placeAddress: lock.placeAddress,
         });
         setUnlockedMap((prev) => ({ ...prev, [lock.id]: true }));
         setTimeout(() => {
@@ -1745,6 +1716,9 @@ export default function App() {
   }, [showNotice]);
 
   const handleLogout = () => {
+    if (session) {
+      void apiLogout(session, 'manual');
+    }
     setProfileMenuOpen(false);
     saveSession(null);
     setSession(null);
@@ -3102,8 +3076,8 @@ export default function App() {
               <h1 className="text-xl font-bold font-display">Раздел «Управление доступом» заблокирован</h1>
               <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
                 {isFullBlocked
-                  ? 'Аккаунт полностью заблокирован администратором. Открытие дверей и ворот, настройка контроллера ESP32 и создание гостевых ссылок отключены — доступен только онлайн-просмотр камер.'
-                  : 'При нулевом балансе раздел «Управление доступом» (настройка ворот ESP32 и создание гостевых ссылок) недоступен. На странице «Обзор» и «Камеры» по-прежнему можно смотреть камеры онлайн и открывать калитки и подъезды.'}
+                  ? 'Аккаунт полностью заблокирован администратором. Открытие дверей и ворот и создание гостевых ссылок отключены — доступен только онлайн-просмотр камер.'
+                  : 'При нулевом балансе раздел «Управление доступом» (открытие ворот и создание гостевых ссылок) недоступен. На странице «Обзор» и «Камеры» по-прежнему можно смотреть камеры онлайн и открывать калитки и подъезды.'}
               </p>
               <div className="flex flex-wrap gap-3 pt-1">
                 <button
@@ -3285,307 +3259,6 @@ export default function App() {
                     </div>
                   );
                 })}
-              </div>
-              )}
-
-              {/* ESP32 Physical Remote Relay Controller Card (Admin-only) */}
-              {billingMe?.user?.role === 'admin' && esp32Status?.config && (
-              <div className="p-6 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06] space-y-5">
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2.5">
-                      <h2 className="text-base font-bold">
-                        Контроллер ворот ESP32
-                      </h2>
-                      <span
-                        className={`text-[11px] font-semibold px-2.5 py-0.5 rounded-md ${
-                          esp32Status?.lastPollAt &&
-                          Date.now() - esp32Status.lastPollAt < 30000
-                            ? 'bg-emerald-500/15 text-emerald-500'
-                            : 'bg-[#2563EB]/10 text-[#2563EB] dark:text-[#3B82F6]'
-                        }`}
-                      >
-                        {esp32Status?.lastPollAt &&
-                        Date.now() - esp32Status.lastPollAt < 30000
-                          ? 'ESP32 на связи'
-                          : esp32Status?.config?.gate1HttpUrl
-                          ? 'Режим прямого HTTP'
-                          : 'Режим очереди команд (Polling)'}
-                      </span>
-                    </div>
-                    <p className="text-xs text-slate-500 dark:text-slate-400 max-w-3xl">
-                      При нажатии «Открыть» на камерах{' '}
-                      <strong>
-                        «
-                        {cameras.find(
-                          (c) =>
-                            (esp32Status?.config?.gate1CameraId && c.id === esp32Status.config.gate1CameraId) ||
-                            c.entranceId === 'esp32_gate_1' ||
-                            (c.originalName || c.name).toLowerCase().includes('фасад 1')
-                        )?.name || 'Камера фасад 1 - 3-Й Мкр 6 б'}
-                        »
-                      </strong>{' '}
-                      (Канал 1 · GPIO {esp32Status?.config?.gpioGate1Pin || 18}
-                      {esp32Status?.config?.gate1CameraId ? ` · ID ${esp32Status.config.gate1CameraId}` : ''}) или{' '}
-                      <strong>
-                        «
-                        {cameras.find(
-                          (c) =>
-                            (esp32Status?.config?.gate2CameraId && c.id === esp32Status.config.gate2CameraId) ||
-                            c.entranceId === 'esp32_gate_2' ||
-                            (c.originalName || c.name).toLowerCase().includes('фасад 2')
-                        )?.name || 'Камера фасад 2 - 3-Й Мкр 6 б'}
-                        »
-                      </strong>{' '}
-                      (Канал 2 · GPIO {esp32Status?.config?.gpioGate2Pin || 19}
-                      {esp32Status?.config?.gate2CameraId ? ` · ID ${esp32Status.config.gate2CameraId}` : ''}) сервер подаёт команду на ESP32, которая через оптопару или реле замыкает соответствующую кнопку пульта ворот на{' '}
-                      <span className="font-mono font-semibold">
-                        {esp32Status?.config?.pulseDurationMs || 600} мс
-                      </span>.
-                    </p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setEsp32SketchOpen((v) => !v)}
-                      className="px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/[0.06] dark:hover:bg-white/[0.1] text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors cursor-pointer"
-                    >
-                      {esp32SketchOpen ? 'Скрыть прошивку ESP32' : 'Прошивка для ESP32'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setEsp32ConfigOpen((v) => !v)}
-                      className="px-3.5 py-2 rounded-xl bg-[#2563EB]/10 hover:bg-[#2563EB]/20 text-xs font-semibold text-[#2563EB] dark:text-[#3B82F6] transition-colors cursor-pointer"
-                    >
-                      {esp32ConfigOpen ? 'Скрыть настройки' : 'Настроить ESP32'}
-                    </button>
-                  </div>
-                </div>
-
-                {esp32ConfigOpen && (
-                  <form
-                    onSubmit={async (e) => {
-                      e.preventDefault();
-                      if (!session || esp32Saving) return;
-                      setEsp32Saving(true);
-                      try {
-                        const baseUrl = esp32HttpUrlInput.trim().replace(/\/+$/, '');
-                        const updated = await apiUpdateEsp32Config(session, {
-                          gate1HttpUrl: baseUrl ? `${baseUrl}/open?channel=1` : '',
-                          gate2HttpUrl: baseUrl ? `${baseUrl}/open?channel=2` : '',
-                          pulseDurationMs: Number(esp32PulseMsInput) || 600,
-                          gpioGate1Pin: Number(esp32Ch1PinInput) || 18,
-                          gpioGate2Pin: Number(esp32Ch2PinInput) || 19,
-                          gate1CameraId: esp32Gate1CamIdInput.trim(),
-                          gate2CameraId: esp32Gate2CamIdInput.trim(),
-                          deviceToken: esp32SecretInput.trim(),
-                        });
-                        setEsp32Status(updated);
-                        if (updated?.config) {
-                          setEsp32Gate1CamIdInput(updated.config.gate1CameraId || '');
-                          setEsp32Gate2CamIdInput(updated.config.gate2CameraId || '');
-                        }
-                        await handleSync(session);
-                        showNotice('Настройки контроллера ворот ESP32 сохранены');
-                      } catch (err: any) {
-                        showNotice(err?.message || 'Ошибка сохранения настроек ESP32');
-                      } finally {
-                        setEsp32Saving(false);
-                      }
-                    }}
-                    className="pt-4 border-t border-slate-100 dark:border-white/[0.06] space-y-3"
-                  >
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <div className="space-y-1">
-                        <label className="block text-xs text-slate-400">
-                          Привязка «Ворота №1» по уникальному ID камеры Дом.ру
-                        </label>
-                        <div className="flex items-center gap-2">
-                          <select
-                            value={cameras.some((c) => c.id === esp32Gate1CamIdInput) ? esp32Gate1CamIdInput : ''}
-                            onChange={(e) => {
-                              if (e.target.value) setEsp32Gate1CamIdInput(e.target.value);
-                            }}
-                            className="flex-1 min-w-0 px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                          >
-                            <option value="">Выбрать камеру из списка…</option>
-                            {cameras.map((c) => (
-                              <option key={c.id} value={c.id}>
-                                {c.name} (ID {c.id})
-                              </option>
-                            ))}
-                          </select>
-                          <input
-                            type="text"
-                            value={esp32Gate1CamIdInput}
-                            onChange={(e) => setEsp32Gate1CamIdInput(e.target.value)}
-                            placeholder="ID камеры 1"
-                            className="w-32 px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                          />
-                        </div>
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="block text-xs text-slate-400">
-                          Привязка «Ворота №2» по уникальному ID камеры Дом.ру
-                        </label>
-                        <div className="flex items-center gap-2">
-                          <select
-                            value={cameras.some((c) => c.id === esp32Gate2CamIdInput) ? esp32Gate2CamIdInput : ''}
-                            onChange={(e) => {
-                              if (e.target.value) setEsp32Gate2CamIdInput(e.target.value);
-                            }}
-                            className="flex-1 min-w-0 px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                          >
-                            <option value="">Выбрать камеру из списка…</option>
-                            {cameras.map((c) => (
-                              <option key={c.id} value={c.id}>
-                                {c.name} (ID {c.id})
-                              </option>
-                            ))}
-                          </select>
-                          <input
-                            type="text"
-                            value={esp32Gate2CamIdInput}
-                            onChange={(e) => setEsp32Gate2CamIdInput(e.target.value)}
-                            placeholder="ID камеры 2"
-                            className="w-32 px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
-                    <div className="space-y-1 sm:col-span-2">
-                      <label className="block text-xs text-slate-400">
-                        HTTP-адрес ESP32 (необязательно, если ESP32 сама опрашивает VPS)
-                      </label>
-                      <input
-                        type="text"
-                        value={esp32HttpUrlInput}
-                        onChange={(e) => setEsp32HttpUrlInput(e.target.value)}
-                        placeholder="Например: http://192.168.1.55 (или оставьте пустым для VPS Polling)"
-                        className="w-full px-3.5 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="block text-xs text-slate-400">
-                        Импульс нажатия (мс)
-                      </label>
-                      <input
-                        type="number"
-                        min={150}
-                        max={3000}
-                        value={esp32PulseMsInput}
-                        onChange={(e) => setEsp32PulseMsInput(e.target.value)}
-                        className="w-full px-3.5 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="space-y-1">
-                        <label className="block text-xs text-slate-400">GPIO Ворота 1</label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={39}
-                          value={esp32Ch1PinInput}
-                          onChange={(e) => setEsp32Ch1PinInput(e.target.value)}
-                          className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="block text-xs text-slate-400">GPIO Ворота 2</label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={39}
-                          value={esp32Ch2PinInput}
-                          onChange={(e) => setEsp32Ch2PinInput(e.target.value)}
-                          className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
-                        />
-                      </div>
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={esp32Saving}
-                      className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer"
-                    >
-                      {esp32Saving ? 'Сохранение...' : 'Сохранить'}
-                    </button>
-                    </div>
-                  </form>
-                )}
-
-                {esp32SketchOpen && (
-                  <div className="pt-4 border-t border-slate-100 dark:border-white/[0.06] space-y-2.5">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-                        Готовый скетч Arduino IDE для ESP32 (работает даже за домашним Wi-Fi без белого IP — опрашивает ваш сервер по /api/eg/esp32/poll)
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const sketch = `// Open-Key ESP32 Gate Remote Relay Controller
-#include <WiFi.h>
-#include <HTTPClient.h>
-
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
-const char* SERVER_POLL_URL = "${typeof window !== 'undefined' ? window.location.origin : 'http://YOUR_VPS_IP:3000'}/api/eg/esp32/poll";
-
-const int PIN_GATE_1 = ${esp32Status?.config?.gpioGate1Pin || 18}; // Кнопка 1 пульта (Камера фасад 1)
-const int PIN_GATE_2 = ${esp32Status?.config?.gpioGate2Pin || 19}; // Кнопка 2 пульта (Камера фасад 2)
-const int PULSE_MS = ${esp32Status?.config?.pulseDurationMs || 600};
-
-void pressRemoteButton(int pin, int durationMs) {
-  digitalWrite(pin, HIGH);
-  delay(durationMs);
-  digitalWrite(pin, LOW);
-}
-
-void setup() {
-  pinMode(PIN_GATE_1, OUTPUT);
-  pinMode(PIN_GATE_2, OUTPUT);
-  digitalWrite(PIN_GATE_1, LOW);
-  digitalWrite(PIN_GATE_2, LOW);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) delay(500);
-}
-
-void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(SERVER_POLL_URL);
-    if (http.GET() == 200) {
-      String body = http.getString();
-      if (body.indexOf("\\"channel\\":1") >= 0) pressRemoteButton(PIN_GATE_1, PULSE_MS);
-      if (body.indexOf("\\"channel\\":2") >= 0) pressRemoteButton(PIN_GATE_2, PULSE_MS);
-    }
-    http.end();
-  }
-  delay(700);
-}`;
-                          navigator.clipboard.writeText(sketch);
-                          showNotice('Код прошивки ESP32 скопирован в буфер обмена');
-                        }}
-                        className="px-3 py-1 rounded-lg bg-[#2563EB]/10 text-[#2563EB] dark:text-[#3B82F6] text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Copy className="w-3.5 h-3.5" />
-                        <span>Скопировать скетч</span>
-                      </button>
-                    </div>
-                    <pre className="p-3.5 rounded-xl bg-slate-900 text-slate-100 text-[11px] font-mono overflow-x-auto leading-relaxed">
-{`// Подключение пульта ворот к ESP32 через 2 оптопары PC817 или 2-канальное реле:
-// GPIO ${esp32Status?.config?.gpioGate1Pin || 18} -> Кнопка 1 на пульте («Камера фасад 1 - 3-Й Мкр 6 б»)
-// GPIO ${esp32Status?.config?.gpioGate2Pin || 19} -> Кнопка 2 на пульте («Камера фасад 2 - 3-Й Мкр 6 б»)
-// Эндпоинт опроса команд для ESP32: GET ${typeof window !== 'undefined' ? window.location.origin : ''}/api/eg/esp32/poll`}
-                    </pre>
-                  </div>
-                )}
               </div>
               )}
 
@@ -4161,8 +3834,10 @@ void loop() {
           {activeSection === 'admin' && billingMe?.user?.role === 'admin' && (
             <AdminPanel
               session={session}
+              cameras={cameras}
               onNotice={showNotice}
               onBillingUpdated={refreshBillingMe}
+              onSyncRequested={() => handleSync(session)}
             />
           )}
 

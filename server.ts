@@ -1507,6 +1507,138 @@ async function startServer() {
     });
   });
 
+  // =========================================================================
+  // Subscriber Audit Logs (Logins, Logouts, Door / Gate Openings)
+  // =========================================================================
+  type SubscriberAuditAction = 'login' | 'logout' | 'door_open';
+  interface ServerSubscriberAuditLogEntry {
+    id: string;
+    userId: string;
+    userName: string;
+    accountId?: string;
+    subscriberId?: string;
+    address?: string;
+    deviceLabel?: string;
+    deviceId?: string;
+    ipAddress?: string;
+    action: SubscriberAuditAction;
+    status: 'success' | 'denied' | 'error';
+    authMethod?: 'password' | 'sms' | 'token' | 'manual' | 'session_expired';
+    targetName?: string;
+    targetKind?: 'door' | 'gate' | 'guest_pass';
+    placeId?: string;
+    accessControlId?: string;
+    entranceId?: string | null;
+    details: string;
+    timestamp: number;
+  }
+
+  const SUBSCRIBER_LOGS_FILE = path.join(__dirname, '.data', 'subscriber-logs.json');
+  const MAX_SUBSCRIBER_LOGS = 2000;
+  let subscriberAuditLogs: ServerSubscriberAuditLogEntry[] = [];
+
+  function loadSubscriberLogsFromDisk() {
+    try {
+      const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(SUBSCRIBER_LOGS_FILE);
+      if (parsed && Array.isArray(parsed.logs)) {
+        subscriberAuditLogs = parsed.logs
+          .filter((item: any) => item && typeof item.id === 'string' && typeof item.action === 'string')
+          .slice(0, MAX_SUBSCRIBER_LOGS);
+        if (wasPlaintext) {
+          saveSubscriberLogsToDisk();
+        }
+      }
+    } catch {
+      // ignore corrupted logs file
+    }
+  }
+
+  function saveSubscriberLogsToDisk() {
+    try {
+      writeEncryptedJsonFile(SUBSCRIBER_LOGS_FILE, {
+        logs: subscriberAuditLogs.slice(0, MAX_SUBSCRIBER_LOGS),
+      });
+    } catch {
+      // ignore disk write failure
+    }
+  }
+
+  function extractClientIp(req: Request): string {
+    const xff = req.headers['x-forwarded-for'];
+    let raw = '';
+    if (typeof xff === 'string' && xff.trim()) {
+      raw = xff.split(',')[0].trim();
+    } else if (Array.isArray(xff) && xff.length > 0) {
+      raw = String(xff[0]).split(',')[0].trim();
+    } else {
+      raw = String(req.ip || req.socket?.remoteAddress || '').trim();
+    }
+    return raw.replace(/^::ffff:/, '').slice(0, 64);
+  }
+
+  function recordSubscriberLog(params: {
+    req?: Request;
+    ctx?: EgRequestContext;
+    user?: {
+      userId?: string;
+      name?: string;
+      accountId?: string;
+      subscriberId?: string;
+      address?: string;
+      deviceLabel?: string;
+      deviceId?: string;
+    } | null;
+    userId?: string;
+    userName?: string;
+    accountId?: string;
+    subscriberId?: string;
+    address?: string;
+    action: SubscriberAuditAction;
+    status: 'success' | 'denied' | 'error';
+    authMethod?: 'password' | 'sms' | 'token' | 'manual' | 'session_expired';
+    targetName?: string;
+    targetKind?: 'door' | 'gate' | 'guest_pass';
+    placeId?: string;
+    accessControlId?: string;
+    entranceId?: string | null;
+    details: string;
+  }) {
+    const ctx = params.ctx || (params.req ? extractContext(params.req) : undefined);
+    const devId = (params.user?.deviceId || (ctx ? extractDeviceIdFromCtx(ctx) : '') || '').trim();
+    const devLabel = (params.user?.deviceLabel || (ctx ? extractDeviceLabelFromCtx(ctx) : '') || '').trim();
+    const ipAddress = params.req ? extractClientIp(params.req) : '';
+
+    const entry: ServerSubscriberAuditLogEntry = {
+      id: `slog_${crypto.randomBytes(6).toString('hex')}`,
+      userId: String(params.user?.userId || params.userId || '').trim(),
+      userName: String(params.user?.name || params.userName || 'Абонент').trim().slice(0, 120),
+      accountId: String(params.user?.accountId || params.accountId || '').trim(),
+      subscriberId: String(params.user?.subscriberId || params.subscriberId || '').trim(),
+      address: String(params.address || params.user?.address || '').trim().slice(0, 200),
+      deviceLabel: devLabel,
+      deviceId: devId,
+      ipAddress,
+      action: params.action,
+      status: params.status,
+      ...(params.authMethod ? { authMethod: params.authMethod } : {}),
+      ...(params.targetName ? { targetName: String(params.targetName).trim().slice(0, 140) } : {}),
+      ...(params.targetKind ? { targetKind: params.targetKind } : {}),
+      ...(params.placeId ? { placeId: String(params.placeId).trim() } : {}),
+      ...(params.accessControlId ? { accessControlId: String(params.accessControlId).trim() } : {}),
+      ...(params.entranceId !== undefined ? { entranceId: params.entranceId } : {}),
+      details: String(params.details || '').trim().slice(0, 240),
+      timestamp: Date.now(),
+    };
+
+    subscriberAuditLogs.unshift(entry);
+    if (subscriberAuditLogs.length > MAX_SUBSCRIBER_LOGS) {
+      subscriberAuditLogs.length = MAX_SUBSCRIBER_LOGS;
+    }
+    saveSubscriberLogsToDisk();
+  }
+
+  loadSubscriberLogsFromDisk();
+
   // 1. Auth Step 1: Query contracts or password requirement by phone
   app.post('/api/eg/auth/login-phone', async (req: Request, res: Response) => {
     try {
@@ -1619,6 +1751,15 @@ async function startServer() {
         deviceLabel: extractDeviceLabelFromCtx(ctx),
       });
       rememberUserDomruSession(authedUser.userId, ctx);
+      recordSubscriberLog({
+        req,
+        ctx,
+        user: authedUser,
+        action: 'login',
+        status: 'success',
+        authMethod: 'password',
+        details: 'Вход в аккаунт по паролю',
+      });
 
       res.json({
         accessToken,
@@ -1746,6 +1887,16 @@ async function startServer() {
         address: contract?.address || '',
       });
       rememberUserDomruSession(smsUser.userId, ctx);
+      recordSubscriberLog({
+        req,
+        ctx,
+        user: smsUser,
+        address: contract?.address || smsUser.address,
+        action: 'login',
+        status: 'success',
+        authMethod: 'sms',
+        details: 'Вход в аккаунт по СМС-коду',
+      });
 
       res.json({
         accessToken,
@@ -1802,6 +1953,15 @@ async function startServer() {
         deviceLabel: extractDeviceLabelFromCtx(ctx),
       });
       rememberUserDomruSession(tokUser.userId, ctx);
+      recordSubscriberLog({
+        req,
+        ctx,
+        user: tokUser,
+        action: 'login',
+        status: 'success',
+        authMethod: 'token',
+        details: 'Вход в аккаунт по Access Token',
+      });
 
       res.json({
         accessToken,
@@ -1815,6 +1975,85 @@ async function startServer() {
         error: 'network_error',
         message: `Ошибка проверки токена: ${err?.message || 'Unknown'}`,
       });
+    }
+  });
+
+  // 5B. Logout audit endpoint
+  app.post('/api/eg/auth/logout', async (req: Request, res: Response) => {
+    try {
+      const ctx = extractContext(req);
+      const token = ctx.accessToken || '';
+      if (token.startsWith('demo_')) {
+        res.json({ ok: true });
+        return;
+      }
+
+      const reason: 'manual' | 'session_expired' =
+        req.body?.reason === 'session_expired' ? 'session_expired' : 'manual';
+
+      const cached = token ? verifiedSessionMap.get(token) : undefined;
+      const bodyPhone = req.body?.phone ? normalizePhone(String(req.body.phone)) : '';
+      const bodyPhoneHash = bodyPhone ? hashPhone(bodyPhone) : '';
+      const cachedPhoneHash = cached?.phone ? hashPhone(cached.phone) : '';
+      const devId = extractDeviceIdFromCtx(ctx);
+      const subId = String(cached?.subscriberId || req.body?.subscriberId || '').trim();
+      const accId = String(cached?.accountId || req.body?.accountId || ctx.userAgent?.account_id || '').trim();
+      const bodyName = String(cached?.name || req.body?.name || '').trim();
+      const bodyAddress = String(req.body?.address || '').trim();
+
+      let matchedUser: ServerBillingUser | undefined = billingStore.users.find((u) => {
+        if ((cachedPhoneHash && u.phoneHash === cachedPhoneHash) || (bodyPhoneHash && u.phoneHash === bodyPhoneHash)) {
+          return true;
+        }
+        if (subId && u.subscriberId === subId && (!devId || !u.deviceId || u.deviceId === devId)) {
+          return true;
+        }
+        return false;
+      });
+
+      if (!matchedUser && devId) {
+        matchedUser = billingStore.users.find((u) => u.deviceId === devId);
+      }
+
+      if (!matchedUser && token) {
+        const verified = await resolveVerifiedSession(req);
+        if (verified.authenticated) {
+          const vPhoneHash = verified.phone ? hashPhone(verified.phone) : '';
+          matchedUser = billingStore.users.find(
+            (u) =>
+              (vPhoneHash && u.phoneHash === vPhoneHash) ||
+              (verified.subscriberId && u.subscriberId === verified.subscriberId && (!devId || !u.deviceId || u.deviceId === devId))
+          );
+        }
+      }
+
+      if (token && reason === 'manual') {
+        verifiedSessionMap.delete(token);
+      }
+
+      if (matchedUser || accId || subId || bodyName) {
+        recordSubscriberLog({
+          req,
+          ctx,
+          user: matchedUser || undefined,
+          userId: matchedUser?.userId || '',
+          userName: matchedUser?.name || bodyName || 'Абонент',
+          accountId: matchedUser?.accountId || accId,
+          subscriberId: matchedUser?.subscriberId || subId,
+          address: matchedUser?.address || bodyAddress,
+          action: 'logout',
+          status: 'success',
+          authMethod: reason,
+          details:
+            reason === 'session_expired'
+              ? 'Автоматический выход (истекла сессия Дом.ру)'
+              : 'Выход из аккаунта пользователем',
+        });
+      }
+
+      res.json({ ok: true });
+    } catch {
+      res.json({ ok: true });
     }
   });
 
@@ -2248,6 +2487,20 @@ async function startServer() {
       });
       rememberUserDomruSession(syncedUser.userId, ctx);
 
+      if (syncedUser.address) {
+        const recentLoginWithoutAddr = subscriberAuditLogs.find(
+          (l) =>
+            l.userId === syncedUser.userId &&
+            l.action === 'login' &&
+            !l.address &&
+            Date.now() - l.timestamp < 2 * 60 * 1000
+        );
+        if (recentLoginWithoutAddr) {
+          recentLoginWithoutAddr.address = syncedUser.address;
+          saveSubscriberLogsToDisk();
+        }
+      }
+
       // Update per-place PRO camera catalog when an owner syncs, and merge any missing PRO cameras for verified co-residents
       for (const pl of places) {
         const pid = String(pl.id || '');
@@ -2407,7 +2660,7 @@ async function startServer() {
       const accessState = await resolveBillingAccessState(req, res);
       if (!accessState.allowed) return;
       const ctx = extractContext(req);
-      const { placeId, accessControlId, entranceId } = req.body || {};
+      const { placeId, accessControlId, entranceId, lockName, placeAddress } = req.body || {};
       if (!placeId || !accessControlId) {
         res.status(400).json({ error: 'missing_params', message: 'Не указан placeId или accessControlId' });
         return;
@@ -2418,9 +2671,40 @@ async function startServer() {
         accessControlId,
         entranceId: entranceId != null ? String(entranceId) : null,
       });
+      const esp32Channel = resolveEsp32ChannelFromLockParams(accessControlId, entranceId);
+      const resolvedTargetName =
+        String(lockName || '').trim() ||
+        (esp32Channel === 1
+          ? 'Ворота №1'
+          : esp32Channel === 2
+            ? 'Ворота №2'
+            : `Точка прохода #${accessControlId}`);
+      const resolvedTargetKind: 'door' | 'gate' =
+        gateLock || esp32Channel !== null ? 'gate' : 'door';
+      const resolvedAddress =
+        String(placeAddress || '').trim() || accessState.user?.address || '';
+
+      const logDoorAction = (status: 'success' | 'denied' | 'error', details: string) => {
+        if (!accessState.user) return;
+        recordSubscriberLog({
+          req,
+          ctx,
+          user: accessState.user,
+          address: resolvedAddress,
+          action: 'door_open',
+          status,
+          targetName: resolvedTargetName,
+          targetKind: resolvedTargetKind,
+          placeId: String(placeId),
+          accessControlId: String(accessControlId),
+          entranceId: entranceId != null ? String(entranceId) : null,
+          details,
+        });
+      };
 
       if (accessState.user) {
         if (accessState.user.status === 'blocked') {
+          logDoorAction('denied', `Отказ: аккаунт заблокирован (${resolvedTargetName})`);
           res.status(402).json({
             error: 'subscription_required',
             status: 'blocked',
@@ -2429,6 +2713,7 @@ async function startServer() {
           return;
         }
         if (accessState.user.status === 'expired' && gateLock) {
+          logDoorAction('denied', `Отказ: недостаточно средств для открытия ворот (${resolvedTargetName})`);
           res.status(402).json({
             error: 'subscription_required',
             status: 'expired',
@@ -2440,9 +2725,9 @@ async function startServer() {
       }
 
       // Check if this lock is an ESP32-controlled gate ("Камера фасад 1" / "Камера фасад 2" of 3-й мкр, д. 6/б)
-      const esp32Channel = resolveEsp32ChannelFromLockParams(accessControlId, entranceId);
       if (esp32Channel !== null) {
         if (!esp32Config.enabled || !isEsp32AuthorizedPlace(String(placeId))) {
+          logDoorAction('denied', `Отказ: ворота недоступны для данного адреса (${resolvedTargetName})`);
           res.status(403).json({
             error: 'esp32_not_available',
             message: 'Управление воротами через ESP32 доступно только для жильцов дома 3-й мкр, д. 6/б.',
@@ -2452,6 +2737,7 @@ async function startServer() {
         if (ctx.accessToken && !ctx.accessToken.startsWith('demo_')) {
           const hasPlaceAccess = await ensureRequesterHasPlaceAccess(ctx, String(placeId));
           if (!hasPlaceAccess) {
+            logDoorAction('denied', `Отказ: нет прав доступа к адресу (${resolvedTargetName})`);
             res.status(403).json({
               error: 'place_access_denied',
               message: 'Нет прав доступа к выбранному адресу для открытия ворот.',
@@ -2460,6 +2746,7 @@ async function startServer() {
           }
         }
         const triggerEvent = await triggerEsp32Gate(esp32Channel);
+        logDoorAction('success', `Ворота открыты: ${resolvedTargetName}`);
         res.json({
           ok: true,
           controller: 'esp32',
@@ -2483,6 +2770,7 @@ async function startServer() {
       });
 
       if (!openRes.ok) {
+        logDoorAction('error', `Отказ оператора (${openRes.status}) при открытии «${resolvedTargetName}»`);
         res.status(openRes.status || 400).json({
           error: 'open_failed',
           message: `Оператор отклонил команду открытия (${openRes.status})`,
@@ -2491,6 +2779,12 @@ async function startServer() {
         return;
       }
 
+      logDoorAction(
+        'success',
+        resolvedTargetKind === 'gate'
+          ? `Ворота открыты: ${resolvedTargetName}`
+          : `Дверь / калитка открыта: ${resolvedTargetName}`
+      );
       res.json({
         ok: true,
         timestamp: new Date().toISOString(),
@@ -4374,6 +4668,21 @@ async function startServer() {
         record.openCount = (record.openCount || 0) + 1;
         record.lastOpenedAt = Date.now();
         saveLocalGuestPassesToDisk();
+        recordSubscriberLog({
+          req,
+          user: ownerRecord || undefined,
+          userId: ownerUserId || '',
+          userName: ownerRecord?.name || 'Владелец пропуска',
+          address: ownerRecord?.address || '',
+          action: 'door_open',
+          status: 'success',
+          targetName: resolvedControl.name,
+          targetKind: 'guest_pass',
+          placeId: record.placeId,
+          accessControlId: String(resolvedControl.id),
+          entranceId: resolvedControl.entranceId || null,
+          details: `Гостевая ссылка${record.label ? ` «${record.label}»` : ''}: открыты ворота (${resolvedControl.name})`,
+        });
         res.json({
           ok: true,
           message: `Сигнал открытия отправлен на ворота: ${resolvedControl.name}`,
@@ -4408,6 +4717,21 @@ async function startServer() {
       });
 
       if (!openRes.ok) {
+        recordSubscriberLog({
+          req,
+          user: ownerRecord || undefined,
+          userId: ownerUserId || '',
+          userName: ownerRecord?.name || 'Владелец пропуска',
+          address: ownerRecord?.address || '',
+          action: 'door_open',
+          status: 'error',
+          targetName: resolvedControl.name,
+          targetKind: 'guest_pass',
+          placeId: record.placeId,
+          accessControlId: String(resolvedControl.id),
+          entranceId: resolvedControl.entranceId || null,
+          details: `Гостевая ссылка${record.label ? ` «${record.label}»` : ''}: отказ оператора (${openRes.status})`,
+        });
         res.status(openRes.status || 400).json({
           error: 'open_failed',
           message: `Оператор отклонил открытие (${openRes.status}). Возможно, сессия владельца устарела — обновите вход в приложении.`,
@@ -4418,6 +4742,22 @@ async function startServer() {
       record.openCount = (record.openCount || 0) + 1;
       record.lastOpenedAt = Date.now();
       saveLocalGuestPassesToDisk();
+
+      recordSubscriberLog({
+        req,
+        user: ownerRecord || undefined,
+        userId: ownerUserId || '',
+        userName: ownerRecord?.name || 'Владелец пропуска',
+        address: ownerRecord?.address || '',
+        action: 'door_open',
+        status: 'success',
+        targetName: resolvedControl.name,
+        targetKind: 'guest_pass',
+        placeId: record.placeId,
+        accessControlId: String(resolvedControl.id),
+        entranceId: resolvedControl.entranceId || null,
+        details: `Гостевая ссылка${record.label ? ` «${record.label}»` : ''}: открыта точка прохода (${resolvedControl.name})`,
+      });
 
       res.json({
         ok: true,
@@ -5054,6 +5394,17 @@ async function startServer() {
     }
     if (remapIds.size > 0) {
       saveDomruSessionsToDisk();
+      let logsRemapped = false;
+      for (const l of subscriberAuditLogs) {
+        const mapped = remapIds.get(l.userId);
+        if (mapped) {
+          l.userId = mapped;
+          logsRemapped = true;
+        }
+      }
+      if (logsRemapped) {
+        saveSubscriberLogsToDisk();
+      }
     }
 
     billingStore.users = mergedUsers;
@@ -6648,6 +6999,94 @@ async function startServer() {
       res.json(buildAdminOverviewPayload());
     } catch (err: any) {
       res.status(500).json({ error: 'config_update_error', message: err?.message || 'Ошибка сохранения настроек' });
+    }
+  });
+
+  // Admin Subscriber Audit Logs (logins, logouts, door opens)
+  app.get('/api/eg/admin/logs', async (req: Request, res: Response) => {
+    if (!(await verifyAdminRequest(req, res))) return;
+    try {
+      const actionFilter = String(req.query.action || 'all').trim();
+      const userIdFilter = String(req.query.userId || '').trim();
+      const searchFilter = String(req.query.search || '').trim().toLowerCase();
+      const limit = Math.max(20, Math.min(1000, Number(req.query.limit) || 300));
+
+      let logins = 0;
+      let logouts = 0;
+      let doorOpens = 0;
+      let deniedOrErrors = 0;
+      for (const item of subscriberAuditLogs) {
+        if (item.action === 'login') logins++;
+        else if (item.action === 'logout') logouts++;
+        else if (item.action === 'door_open') doorOpens++;
+        if (item.status !== 'success') deniedOrErrors++;
+      }
+
+      const filtered = subscriberAuditLogs
+        .filter((item) => {
+          if (actionFilter && actionFilter !== 'all' && item.action !== actionFilter) {
+            return false;
+          }
+          if (userIdFilter && item.userId !== userIdFilter) {
+            return false;
+          }
+          if (searchFilter) {
+            const hay = [
+              item.userName,
+              item.accountId,
+              item.address,
+              item.targetName,
+              item.details,
+              item.deviceLabel,
+              item.ipAddress,
+            ]
+              .filter(Boolean)
+              .join(' ')
+              .toLowerCase();
+            if (!hay.includes(searchFilter)) return false;
+          }
+          return true;
+        })
+        .slice(0, limit);
+
+      res.json({
+        logs: filtered,
+        stats: {
+          total: subscriberAuditLogs.length,
+          logins,
+          logouts,
+          doorOpens,
+          deniedOrErrors,
+        },
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error: 'admin_logs_error',
+        message: err?.message || 'Ошибка загрузки логов абонентов',
+      });
+    }
+  });
+
+  app.post('/api/eg/admin/logs/clear', async (req: Request, res: Response) => {
+    if (!(await verifyAdminRequest(req, res))) return;
+    try {
+      subscriberAuditLogs = [];
+      saveSubscriberLogsToDisk();
+      res.json({
+        logs: [],
+        stats: {
+          total: 0,
+          logins: 0,
+          logouts: 0,
+          doorOpens: 0,
+          deniedOrErrors: 0,
+        },
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error: 'admin_logs_clear_error',
+        message: err?.message || 'Ошибка очистки логов абонентов',
+      });
     }
   });
 
