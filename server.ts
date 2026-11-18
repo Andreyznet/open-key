@@ -764,6 +764,179 @@ async function startServer() {
 
   loadCameraAliasesFromDisk();
 
+  // =========================================================================
+  // Encrypted Per-Place PRO Camera Catalog (shared strictly across verified co-residents of the same Dom.ru placeId)
+  // =========================================================================
+  interface CachedPlaceCameraEntry {
+    id: string;
+    name: string;
+    placeId: string;
+    placeAddress: string;
+    source: string;
+    timeZone: number;
+    retentionDays: number;
+    allowOpen: boolean;
+    videoDownloadAvailable: boolean;
+  }
+
+  interface PlaceCameraCatalogRecord {
+    placeId: string;
+    ownerUserId: string;
+    updatedAt: number;
+    cameras: CachedPlaceCameraEntry[];
+  }
+
+  const PLACE_CAMERAS_FILE = path.join(ESP32_DATA_DIR, 'place-cameras.json');
+  const placeCameraCatalog = new Map<string, PlaceCameraCatalogRecord>();
+  const verifiedTokenPlacesMap = new Map<string, { placeIds: Set<string>; verifiedAt: number }>();
+
+  function loadPlaceCameraCatalogFromDisk() {
+    try {
+      const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(PLACE_CAMERAS_FILE);
+      if (parsed && typeof parsed.places === 'object' && parsed.places !== null) {
+        for (const [pid, rec] of Object.entries(parsed.places as Record<string, any>)) {
+          if (pid && rec && Array.isArray(rec.cameras)) {
+            placeCameraCatalog.set(String(pid), {
+              placeId: String(pid),
+              ownerUserId: String(rec.ownerUserId || ''),
+              updatedAt: Number(rec.updatedAt) || Date.now(),
+              cameras: rec.cameras.map((c: any) => ({
+                id: String(c.id || ''),
+                name: String(c.name || `Камера ${c.id || ''}`),
+                placeId: String(c.placeId || pid),
+                placeAddress: String(c.placeAddress || ''),
+                source: String(c.source || 'public'),
+                timeZone: Number(c.timeZone) || 25200,
+                retentionDays: Math.max(1, Math.min(7, Number(c.retentionDays) || 7)),
+                allowOpen: false,
+                videoDownloadAvailable: Boolean(c.videoDownloadAvailable ?? true),
+              })).filter((c: CachedPlaceCameraEntry) => Boolean(c.id)),
+            });
+          }
+        }
+        if (wasPlaintext) {
+          savePlaceCameraCatalogToDisk();
+        }
+      }
+    } catch {
+      // ignore corrupted place camera catalog
+    }
+  }
+
+  function savePlaceCameraCatalogToDisk() {
+    try {
+      const placesObj: Record<string, PlaceCameraCatalogRecord> = {};
+      for (const [pid, rec] of placeCameraCatalog.entries()) {
+        placesObj[pid] = rec;
+      }
+      writeEncryptedJsonFile(PLACE_CAMERAS_FILE, { places: placesObj });
+    } catch {
+      // ignore disk write error
+    }
+  }
+
+  function upsertPlaceCameraCatalog(
+    placeId: string,
+    ownerUserId: string,
+    camList: any[]
+  ) {
+    if (!placeId || !ownerUserId || !Array.isArray(camList) || camList.length === 0) return;
+    const pid = String(placeId);
+    const normalized: CachedPlaceCameraEntry[] = camList
+      .filter((c) => c && c.id)
+      .map((c) => ({
+        id: String(c.id),
+        name: String(c.originalName || c.name || `Камера ${c.id}`),
+        placeId: pid,
+        placeAddress: String(c.placeAddress || ''),
+        source: String(c.source || 'public'),
+        timeZone: Number(c.timeZone) || 25200,
+        retentionDays: Math.max(1, Math.min(7, Number(c.retentionDays) || 7)),
+        allowOpen: false,
+        videoDownloadAvailable: Boolean(c.videoDownloadAvailable ?? true),
+      }));
+    if (normalized.length === 0) return;
+    placeCameraCatalog.set(pid, {
+      placeId: pid,
+      ownerUserId: String(ownerUserId),
+      updatedAt: Date.now(),
+      cameras: normalized,
+    });
+    savePlaceCameraCatalogToDisk();
+  }
+
+  function recordTokenPlaces(accessToken: string | undefined, placeIds: string[]) {
+    if (!accessToken || accessToken.startsWith('demo_')) return;
+    const cleanIds = new Set(placeIds.map((p) => String(p).trim()).filter(Boolean));
+    verifiedTokenPlacesMap.set(accessToken, {
+      placeIds: cleanIds,
+      verifiedAt: Date.now(),
+    });
+  }
+
+  async function ensureRequesterHasPlaceAccess(
+    ctx: EgRequestContext,
+    placeId: string
+  ): Promise<boolean> {
+    if (!ctx.accessToken || ctx.accessToken.startsWith('demo_') || !placeId || placeId === 'null') {
+      return false;
+    }
+    const cached = verifiedTokenPlacesMap.get(ctx.accessToken);
+    if (cached && Date.now() - cached.verifiedAt < VERIFIED_SESSION_TTL_MS) {
+      return cached.placeIds.has(String(placeId));
+    }
+    try {
+      const placesRes = await egFetch('/rest/v3/subscriber-places', ctx);
+      const rawList: any[] = Array.isArray(placesRes.data?.data) ? placesRes.data.data : [];
+      const ids = rawList
+        .map((sp: any) => (sp?.place?.id != null ? String(sp.place.id) : ''))
+        .filter(Boolean);
+      recordTokenPlaces(ctx.accessToken, ids);
+      return ids.includes(String(placeId));
+    } catch {
+      return false;
+    }
+  }
+
+  async function getOwnerCtxForSharedPlaceCamera(
+    requesterCtx: EgRequestContext,
+    placeId: string,
+    cameraId: string
+  ): Promise<EgRequestContext | null> {
+    if (
+      !requesterCtx.accessToken ||
+      requesterCtx.accessToken.startsWith('demo_') ||
+      !placeId ||
+      placeId === 'null' ||
+      !cameraId
+    ) {
+      return null;
+    }
+    const catalog = placeCameraCatalog.get(String(placeId));
+    if (!catalog || !catalog.ownerUserId) return null;
+    const hasCam = catalog.cameras.some((c) => c.id === String(cameraId));
+    if (!hasCam) return null;
+    const allowed = await ensureRequesterHasPlaceAccess(requesterCtx, String(placeId));
+    if (!allowed) return null;
+    const ownerSess = userDomruSessionMap.get(catalog.ownerUserId);
+    if (
+      !ownerSess ||
+      !ownerSess.accessToken ||
+      ownerSess.accessToken.startsWith('demo_') ||
+      ownerSess.accessToken === requesterCtx.accessToken
+    ) {
+      return null;
+    }
+    return {
+      accessToken: ownerSess.accessToken,
+      operatorId: ownerSess.operatorId || requesterCtx.operatorId || '1',
+      userAgent: ownerSess.userAgent || requesterCtx.userAgent,
+      hasExplicitUuid: true,
+    };
+  }
+
+  loadPlaceCameraCatalogFromDisk();
+
   const placeControlCameraIdMap = new Map<string, string>();
   function rememberPlaceControlCamera(
     placeId: string | undefined,
@@ -1355,14 +1528,25 @@ async function startServer() {
       if (syncIdentity.accountId && !ctx.userAgent.account_id) {
         ctx.userAgent.account_id = syncIdentity.accountId;
       }
+      if ((!ctx.operatorId || ctx.operatorId === '1') && rawPlaces[0]?.place?.operatorId != null) {
+        const placeOpId = String(rawPlaces[0].place.operatorId);
+        ctx.operatorId = placeOpId;
+        ctx.userAgent.operator_id = placeOpId;
+      }
       if (ctx.accessToken && !ctx.accessToken.startsWith('demo_')) {
         cacheVerifiedSession(ctx.accessToken, syncIdentity);
+        recordTokenPlaces(
+          ctx.accessToken,
+          rawPlaces.map((sp: any) => (sp?.place?.id != null ? String(sp.place.id) : '')).filter(Boolean)
+        );
       }
       const places: any[] = [];
       const balances: Record<string, any> = {};
       const cameras: any[] = [];
       const locks: any[] = [];
       const dndByPlace: Record<string, any[]> = {};
+      const hiddenCamIdsByPlace = new Map<string, Set<string>>();
+      const favoriteCamIdsByPlace = new Map<string, Set<string>>();
 
       // Sequential per place to preserve UA place_id fingerprint (ADR-0006)
       for (const sp of rawPlaces) {
@@ -1631,6 +1815,9 @@ async function startServer() {
           // Non-fatal
         }
 
+        hiddenCamIdsByPlace.set(placeId, hiddenCamIds);
+        favoriteCamIdsByPlace.set(placeId, favoriteCamIds);
+
         // 6. Do Not Disturb settings
         try {
           const dndRes = await egFetch(
@@ -1646,45 +1833,66 @@ async function startServer() {
         }
       }
 
-      // 6B. Global Forpost cameras endpoint (`/rest/v1/forpost/cameras` — exposes PRO & neighbor-entrance cameras with capitalized ID/Name)
+      // 6B. Global & per-place Forpost cameras endpoint (`/rest/v1/forpost/cameras` — exposes PRO & neighbor-entrance cameras)
+      const extractForpostArray = (payload: any): any[] => {
+        if (Array.isArray(payload)) return payload;
+        if (Array.isArray(payload?.data)) return payload.data;
+        if (Array.isArray(payload?.items)) return payload.items;
+        if (Array.isArray(payload?.cameras)) return payload.cameras;
+        return [];
+      };
+
+      const pushForpostCameras = (fpList: any[], fallbackPlaceId: string, fallbackPlaceAddress: string) => {
+        for (const cam of fpList) {
+          if (!cam || typeof cam !== 'object') continue;
+          const cid = String(cam.ID ?? cam.id ?? cam.externalCameraId ?? cam.cameraId ?? '').trim();
+          if (!cid) continue;
+          const rawPlaceId = cam.placeId ?? cam.PlaceID ?? cam.place_id;
+          const matchedPlace =
+            rawPlaceId != null
+              ? places.find((p) => String(p.id) === String(rawPlaceId))
+              : null;
+          const resolvedPlaceId = matchedPlace?.id || (rawPlaceId != null ? String(rawPlaceId) : fallbackPlaceId);
+          cameras.push({
+            id: cid,
+            name: String(cam.Name || cam.name || cam.title || `Камера ${cid}`),
+            placeId: resolvedPlaceId,
+            placeAddress: matchedPlace?.address || fallbackPlaceAddress,
+            accessControlId: null,
+            entranceId: null,
+            source: 'public',
+            hidden: hiddenCamIdsByPlace.get(resolvedPlaceId)?.has(cid) || false,
+            favorite: favoriteCamIdsByPlace.get(resolvedPlaceId)?.has(cid) || false,
+            timeZone: Number(cam.TimeZone ?? cam.timeZone ?? 25200) || 25200,
+            retentionDays: Math.max(1, Math.min(7, Number(cam.RetentionDays || cam.retentionDays || cam.archiveDays || 7) || 7)),
+            allowOpen: false,
+            videoDownloadAvailable: true,
+          });
+        }
+      };
+
       try {
-        const fpRes = await egFetch('/rest/v1/forpost/cameras', ctx);
+        const defaultPlaceId = places[0]?.id || '1';
+        const defaultPlaceAddress = places[0]?.address || 'Мой дом';
+        const fpRes = await egFetch('/rest/v1/forpost/cameras', ctx, {
+          placeIdOverride: places[0]?.id || undefined,
+        });
         if (fpRes.ok) {
-          const fpList = Array.isArray(fpRes.data)
-            ? fpRes.data
-            : Array.isArray(fpRes.data?.data)
-              ? fpRes.data.data
-              : Array.isArray(fpRes.data?.items)
-                ? fpRes.data.items
-                : Array.isArray(fpRes.data?.cameras)
-                  ? fpRes.data.cameras
-                  : [];
-          const defaultPlaceId = places[0]?.id || '1';
-          const defaultPlaceAddress = places[0]?.address || 'Мой дом';
-          for (const cam of fpList) {
-            if (!cam || typeof cam !== 'object') continue;
-            const cid = String(cam.ID ?? cam.id ?? cam.externalCameraId ?? cam.cameraId ?? '').trim();
-            if (!cid) continue;
-            const rawPlaceId = cam.placeId ?? cam.PlaceID ?? cam.place_id;
-            const matchedPlace =
-              rawPlaceId != null
-                ? places.find((p) => String(p.id) === String(rawPlaceId))
-                : null;
-            cameras.push({
-              id: cid,
-              name: String(cam.Name || cam.name || cam.title || `Камера ${cid}`),
-              placeId: matchedPlace?.id || (rawPlaceId != null ? String(rawPlaceId) : defaultPlaceId),
-              placeAddress: matchedPlace?.address || defaultPlaceAddress,
-              accessControlId: null,
-              entranceId: null,
-              source: 'public',
-              hidden: false,
-              favorite: false,
-              timeZone: Number(cam.TimeZone ?? cam.timeZone ?? 25200) || 25200,
-              retentionDays: Math.max(1, Math.min(7, Number(cam.RetentionDays || cam.retentionDays || cam.archiveDays || 7) || 7)),
-              allowOpen: false,
-              videoDownloadAvailable: true,
-            });
+          pushForpostCameras(extractForpostArray(fpRes.data), defaultPlaceId, defaultPlaceAddress);
+        }
+        // Also query per-place Forpost endpoint with explicit placeId for guest/multi-place accounts
+        for (const p of places.slice(0, 3)) {
+          try {
+            const fpPlaceRes = await egFetch(
+              `/rest/v1/forpost/cameras?placeId=${encodeURIComponent(p.id)}`,
+              ctx,
+              { placeIdOverride: p.id }
+            );
+            if (fpPlaceRes.ok) {
+              pushForpostCameras(extractForpostArray(fpPlaceRes.data), p.id, p.address || defaultPlaceAddress);
+            }
+          } catch {
+            // Non-fatal
           }
         }
       } catch {
@@ -1746,6 +1954,43 @@ async function startServer() {
         address: places[0]?.address || '',
       });
       rememberUserDomruSession(syncedUser.userId, ctx);
+
+      // Update per-place PRO camera catalog when an owner syncs, and merge any missing PRO cameras for verified co-residents
+      for (const pl of places) {
+        const pid = String(pl.id || '');
+        if (!pid) continue;
+        const isPlaceOwner =
+          pl.subscriberType === 'owner' ||
+          isOwnerIdentity(syncIdentity.phone, syncIdentity.subscriberId);
+        const placeCams = dedupedCameras.filter((c) => String(c.placeId) === pid);
+        if (isPlaceOwner && placeCams.length > 0) {
+          upsertPlaceCameraCatalog(pid, syncedUser.userId, placeCams);
+        } else {
+          const catalog = placeCameraCatalog.get(pid);
+          if (catalog && Array.isArray(catalog.cameras)) {
+            for (const cachedCam of catalog.cameras) {
+              if (!seenCamIds.has(cachedCam.id)) {
+                seenCamIds.add(cachedCam.id);
+                dedupedCameras.push({
+                  id: cachedCam.id,
+                  name: cachedCam.name,
+                  placeId: pid,
+                  placeAddress: pl.address || cachedCam.placeAddress,
+                  accessControlId: null,
+                  entranceId: null,
+                  source: cachedCam.source || 'public',
+                  hidden: hiddenCamIdsByPlace.get(pid)?.has(cachedCam.id) || false,
+                  favorite: favoriteCamIdsByPlace.get(pid)?.has(cachedCam.id) || false,
+                  timeZone: cachedCam.timeZone || 25200,
+                  retentionDays: cachedCam.retentionDays || 7,
+                  allowOpen: false,
+                  videoDownloadAvailable: cachedCam.videoDownloadAvailable,
+                });
+              }
+            }
+          }
+        }
+      }
 
       for (const lock of locks) {
         rememberPlaceControlCamera(
@@ -1903,6 +2148,16 @@ async function startServer() {
         });
       }
 
+      if ((!snapRes.ok || !snapRes.buffer || snapRes.buffer.length === 0) && placeId !== 'null') {
+        const ownerCtx = await getOwnerCtxForSharedPlaceCamera(ctx, placeId, cameraId);
+        if (ownerCtx) {
+          snapRes = await egFetch(primaryUrl, ownerCtx, {
+            binary: true,
+            placeIdOverride: placeId,
+          });
+        }
+      }
+
       if (!snapRes.ok || !snapRes.buffer || snapRes.buffer.length === 0) {
         res.status(snapRes.status || 502).json({
           error: 'snapshot_unavailable',
@@ -1985,12 +2240,29 @@ async function startServer() {
         apiUrl = `/rest/v1/forpost/cameras/${encodeURIComponent(cameraId)}/video?TS=${encodeURIComponent(ts)}&TZ=${encodeURIComponent(tz)}&LightStream=0&Format=H264&Speed=${encodeURIComponent(speedParam)}`;
       }
 
-      const streamRes = await egFetch(apiUrl, ctx, { placeIdOverride: placeId });
-      const streamUrl =
+      let streamRes = await egFetch(apiUrl, ctx, { placeIdOverride: placeId });
+      let streamUrl =
         streamRes.data?.data?.URL ||
         streamRes.data?.data?.url ||
         streamRes.data?.URL ||
         streamRes.data?.url;
+
+      if ((!streamRes.ok || !streamUrl) && placeId !== 'null') {
+        const ownerCtx = await getOwnerCtxForSharedPlaceCamera(ctx, placeId, cameraId);
+        if (ownerCtx) {
+          const ownerStreamRes = await egFetch(apiUrl, ownerCtx, { placeIdOverride: placeId });
+          const ownerUrl =
+            ownerStreamRes.data?.data?.URL ||
+            ownerStreamRes.data?.data?.url ||
+            ownerStreamRes.data?.URL ||
+            ownerStreamRes.data?.url;
+          if (ownerStreamRes.ok && ownerUrl) {
+            streamRes = ownerStreamRes;
+            streamUrl = ownerUrl;
+          }
+        }
+      }
+
       const bizError = streamRes.data?.data?.Error || streamRes.data?.errorMessage;
 
       if (!streamRes.ok || !streamUrl) {
@@ -2331,13 +2603,28 @@ async function startServer() {
         orderByTime: 'DESC',
       }).toString();
 
-      const evRes = await egFetch(
+      let evRes = await egFetch(
         `/rest/v2/forpost/cameras/${encodeURIComponent(cameraId)}/events?${query}`,
         ctx,
         { placeIdOverride: placeId }
       );
 
-      const rawList: any[] = Array.isArray(evRes.data?.data) ? evRes.data.data : [];
+      let rawList: any[] = Array.isArray(evRes.data?.data) ? evRes.data.data : [];
+      if ((!evRes.ok || rawList.length === 0) && placeId !== 'null') {
+        const ownerCtx = await getOwnerCtxForSharedPlaceCamera(ctx, placeId, cameraId);
+        if (ownerCtx) {
+          const ownerEvRes = await egFetch(
+            `/rest/v2/forpost/cameras/${encodeURIComponent(cameraId)}/events?${query}`,
+            ownerCtx,
+            { placeIdOverride: placeId }
+          );
+          const ownerList: any[] = Array.isArray(ownerEvRes.data?.data) ? ownerEvRes.data.data : [];
+          if (ownerEvRes.ok && ownerList.length > 0) {
+            evRes = ownerEvRes;
+            rawList = ownerList;
+          }
+        }
+      }
       const events = rawList
         .map((item) => ({
           id: String(item.ID),
