@@ -428,10 +428,15 @@ export interface Esp32GateConfig {
   deviceToken: string;
   gpioGate1Pin: number;
   gpioGate2Pin: number;
+  gate1CameraId?: string;
+  gate2CameraId?: string;
+  allowedPlaceIds?: string[];
 }
 
 export interface Esp32GateStatusPayload {
-  config: Esp32GateConfig;
+  authorized?: boolean;
+  isAdmin?: boolean;
+  config: Esp32GateConfig | null;
   lastPollAt: number | null;
   pendingCommandsCount: number;
   recentTriggers: Array<{

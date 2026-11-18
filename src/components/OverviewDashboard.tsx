@@ -150,8 +150,8 @@ function getPrimaryCameraRank(cam: CameraItem, linkedLock: LockItem | null): num
   if (n.includes('калитк') && n.includes('2')) return 2;
   if (n.includes('калитк')) return 3;
   if (n.includes('п. 2') || n.includes('п.2') || n.includes('подъезд')) return 4;
-  if (n.includes('фасад 1') || n.includes('фасад №1') || linkedLock?.esp32Channel === 1) return 5;
-  if (n.includes('фасад 2') || n.includes('фасад №2') || linkedLock?.esp32Channel === 2) return 6;
+  if (linkedLock?.esp32Channel === 1 || cam.entranceId === 'esp32_gate_1') return 5;
+  if (linkedLock?.esp32Channel === 2 || cam.entranceId === 'esp32_gate_2') return 6;
   if (cam.source === 'intercom') return 7;
   if (cam.allowOpen || linkedLock?.openable) return 8;
   return 99;
@@ -161,14 +161,15 @@ function getCameraShortBadge(cam: CameraItem, linkedLock: LockItem | null): stri
   const n = (cam.originalName || cam.name).toLowerCase();
   if (
     linkedLock?.controllerType === 'esp32' ||
-    cam.entranceId?.startsWith('esp32_gate_') ||
-    n.includes('фасад 1') ||
-    n.includes('фасад 2')
+    cam.entranceId?.startsWith('esp32_gate_')
   ) {
     const ch =
       linkedLock?.esp32Channel ||
       (n.includes('фасад 2') || cam.entranceId === 'esp32_gate_2' ? 2 : 1);
     return `Ворота ${ch}`;
+  }
+  if (linkedLock?.openable && isGateOnlyLock(linkedLock, cam)) {
+    return 'Ворота';
   }
   if (n.includes('калитк')) return 'Калитка · Домофон';
   if (n.includes('п. 2') || n.includes('п.2') || n.includes('подъезд') || cam.source === 'intercom') {
@@ -362,6 +363,14 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   const openableLocks = useMemo(() => {
     return locks.filter((l) => l.openable);
   }, [locks]);
+
+  const hasEsp32Gates = useMemo(() => {
+    return (
+      locks.some(
+        (l) => l.controllerType === 'esp32' || l.entranceId?.startsWith('esp32_gate_')
+      ) || cameras.some((c) => c.entranceId?.startsWith('esp32_gate_'))
+    );
+  }, [locks, cameras]);
 
   const activePlace = useMemo(() => {
     if (selectedPlaceId !== 'all') {
@@ -615,7 +624,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 Основные камеры и управление входами ({primaryCameras.length})
               </h2>
               <p className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400">
-                Калитки 1–2, подъезд и въездные ворота (Фасад 1–2)
+                {hasEsp32Gates
+                  ? 'Калитки 1–2, подъезд и въездные ворота (Фасад 1–2)'
+                  : 'Доступные входы, калитки и ключевые камеры дома'}
               </p>
             </div>
 
@@ -1024,7 +1035,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 Быстрое открытие
               </h2>
               <p className="text-[11px] text-slate-400">
-                Калитки, подъезд и ворота
+                {hasEsp32Gates
+                  ? 'Калитки, подъезд и ворота'
+                  : 'Домофоны, калитки и подъезды'}
               </p>
             </div>
             {!effectiveRestricted && (

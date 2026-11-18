@@ -324,6 +324,8 @@ export default function App() {
   const [esp32PulseMsInput, setEsp32PulseMsInput] = useState<string>('600');
   const [esp32Ch1PinInput, setEsp32Ch1PinInput] = useState<string>('18');
   const [esp32Ch2PinInput, setEsp32Ch2PinInput] = useState<string>('19');
+  const [esp32Gate1CamIdInput, setEsp32Gate1CamIdInput] = useState<string>('');
+  const [esp32Gate2CamIdInput, setEsp32Gate2CamIdInput] = useState<string>('');
   const [esp32SecretInput, setEsp32SecretInput] = useState<string>('');
 
   const showNotice = useCallback((msg: string) => {
@@ -360,63 +362,11 @@ export default function App() {
       const syncedCameras = (data.cameras || []).map((rawCam) => {
         const originalName = rawCam.originalName || rawCam.name;
         const customAlias = syncedAliases[rawCam.id];
-        const cam: CameraItem = {
+        return {
           ...rawCam,
           originalName,
           name: customAlias && customAlias.trim() ? customAlias.trim() : rawCam.name,
-        };
-        const lower = originalName.toLowerCase();
-        const isFacade1 =
-          lower.includes('фасад 1') ||
-          lower.includes('фасад №1') ||
-          lower.includes('фасад-1') ||
-          lower.includes('ворота 1');
-        const isFacade2 =
-          lower.includes('фасад 2') ||
-          lower.includes('фасад №2') ||
-          lower.includes('фасад-2') ||
-          lower.includes('ворота 2');
-        if (!isFacade1 && !isFacade2) return cam;
-
-        const ch: 1 | 2 = isFacade2 ? 2 : 1;
-        const acId = ch === 1 ? '990001' : '990002';
-        const entId = ch === 1 ? 'esp32_gate_1' : 'esp32_gate_2';
-        const lockId = `${cam.placeId || defaultPlace?.id || '1'}_esp32_gate_${ch}`;
-
-        if (
-          !syncedLocks.some(
-            (l) =>
-              l.id === lockId ||
-              l.externalCameraId === cam.id ||
-              l.entranceId === entId ||
-              l.esp32Channel === ch
-          )
-        ) {
-          syncedLocks.push({
-            id: lockId,
-            placeId: cam.placeId || defaultPlace?.id || '1',
-            placeAddress: cam.placeAddress || defaultPlace?.address || 'Мой дом',
-            accessControlId: acId,
-            entranceId: entId,
-            acName: `Ворота №${ch}`,
-            name: originalName,
-            openable: true,
-            allowVideo: true,
-            externalCameraId: cam.id,
-            hidden: false,
-            favorite: true,
-            kind: 'gate',
-            controllerType: 'esp32',
-            esp32Channel: ch,
-          });
-        }
-
-        return {
-          ...cam,
-          allowOpen: true,
-          accessControlId: cam.accessControlId || acId,
-          entranceId: cam.entranceId || entId,
-        };
+        } as CameraItem;
       });
 
       setPlaces(syncedPlaces);
@@ -448,14 +398,18 @@ export default function App() {
       apiGetEsp32Status(activeSession)
         .then((st) => {
           setEsp32Status(st);
-          setEsp32HttpUrlInput(st.config.gate1HttpUrl || '');
-          setEsp32PulseMsInput(String(st.config.pulseDurationMs || 600));
-          setEsp32Ch1PinInput(String(st.config.gpioGate1Pin || 18));
-          setEsp32Ch2PinInput(String(st.config.gpioGate2Pin || 19));
-          setEsp32SecretInput(st.config.deviceToken || '');
+          if (st?.config) {
+            setEsp32HttpUrlInput(st.config.gate1HttpUrl || '');
+            setEsp32PulseMsInput(String(st.config.pulseDurationMs || 600));
+            setEsp32Ch1PinInput(String(st.config.gpioGate1Pin || 18));
+            setEsp32Ch2PinInput(String(st.config.gpioGate2Pin || 19));
+            setEsp32Gate1CamIdInput(st.config.gate1CameraId || '');
+            setEsp32Gate2CamIdInput(st.config.gate2CameraId || '');
+            setEsp32SecretInput(st.config.deviceToken || '');
+          }
         })
         .catch(() => {
-          // non-fatal
+          setEsp32Status(null);
         });
 
       const pIds = (data.places || []).map((p) => p.id).filter(Boolean);
@@ -3179,6 +3133,11 @@ export default function App() {
                 </p>
               </div>
 
+              {filteredLocks.length === 0 && session.mode !== 'demo' ? (
+                <div className="p-6 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06] text-xs sm:text-sm text-slate-500 dark:text-slate-400">
+                  Для выбранного адреса пока нет подключённых точек прохода (калиток, подъездов или ворот).
+                </div>
+              ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {(filteredLocks.length > 0
                   ? filteredLocks
@@ -3327,8 +3286,10 @@ export default function App() {
                   );
                 })}
               </div>
+              )}
 
-              {/* ESP32 Physical Remote Relay Controller Card */}
+              {/* ESP32 Physical Remote Relay Controller Card (Admin-only) */}
+              {billingMe?.user?.role === 'admin' && esp32Status?.config && (
               <div className="p-6 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06] space-y-5">
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div className="space-y-1">
@@ -3358,22 +3319,26 @@ export default function App() {
                         «
                         {cameras.find(
                           (c) =>
+                            (esp32Status?.config?.gate1CameraId && c.id === esp32Status.config.gate1CameraId) ||
                             c.entranceId === 'esp32_gate_1' ||
                             (c.originalName || c.name).toLowerCase().includes('фасад 1')
                         )?.name || 'Камера фасад 1 - 3-Й Мкр 6 б'}
                         »
                       </strong>{' '}
-                      (Канал 1 · GPIO {esp32Status?.config?.gpioGate1Pin || 18}) или{' '}
+                      (Канал 1 · GPIO {esp32Status?.config?.gpioGate1Pin || 18}
+                      {esp32Status?.config?.gate1CameraId ? ` · ID ${esp32Status.config.gate1CameraId}` : ''}) или{' '}
                       <strong>
                         «
                         {cameras.find(
                           (c) =>
+                            (esp32Status?.config?.gate2CameraId && c.id === esp32Status.config.gate2CameraId) ||
                             c.entranceId === 'esp32_gate_2' ||
                             (c.originalName || c.name).toLowerCase().includes('фасад 2')
                         )?.name || 'Камера фасад 2 - 3-Й Мкр 6 б'}
                         »
                       </strong>{' '}
-                      (Канал 2 · GPIO {esp32Status?.config?.gpioGate2Pin || 19}) сервер подаёт команду на ESP32, которая через оптопару или реле замыкает соответствующую кнопку пульта ворот на{' '}
+                      (Канал 2 · GPIO {esp32Status?.config?.gpioGate2Pin || 19}
+                      {esp32Status?.config?.gate2CameraId ? ` · ID ${esp32Status.config.gate2CameraId}` : ''}) сервер подаёт команду на ESP32, которая через оптопару или реле замыкает соответствующую кнопку пульта ворот на{' '}
                       <span className="font-mono font-semibold">
                         {esp32Status?.config?.pulseDurationMs || 600} мс
                       </span>.
@@ -3412,9 +3377,16 @@ export default function App() {
                           pulseDurationMs: Number(esp32PulseMsInput) || 600,
                           gpioGate1Pin: Number(esp32Ch1PinInput) || 18,
                           gpioGate2Pin: Number(esp32Ch2PinInput) || 19,
+                          gate1CameraId: esp32Gate1CamIdInput.trim(),
+                          gate2CameraId: esp32Gate2CamIdInput.trim(),
                           deviceToken: esp32SecretInput.trim(),
                         });
                         setEsp32Status(updated);
+                        if (updated?.config) {
+                          setEsp32Gate1CamIdInput(updated.config.gate1CameraId || '');
+                          setEsp32Gate2CamIdInput(updated.config.gate2CameraId || '');
+                        }
+                        await handleSync(session);
                         showNotice('Настройки контроллера ворот ESP32 сохранены');
                       } catch (err: any) {
                         showNotice(err?.message || 'Ошибка сохранения настроек ESP32');
@@ -3422,8 +3394,69 @@ export default function App() {
                         setEsp32Saving(false);
                       }
                     }}
-                    className="pt-4 border-t border-slate-100 dark:border-white/[0.06] grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end"
+                    className="pt-4 border-t border-slate-100 dark:border-white/[0.06] space-y-3"
                   >
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label className="block text-xs text-slate-400">
+                          Привязка «Ворота №1» по уникальному ID камеры Дом.ру
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={cameras.some((c) => c.id === esp32Gate1CamIdInput) ? esp32Gate1CamIdInput : ''}
+                            onChange={(e) => {
+                              if (e.target.value) setEsp32Gate1CamIdInput(e.target.value);
+                            }}
+                            className="flex-1 min-w-0 px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                          >
+                            <option value="">Выбрать камеру из списка…</option>
+                            {cameras.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name} (ID {c.id})
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="text"
+                            value={esp32Gate1CamIdInput}
+                            onChange={(e) => setEsp32Gate1CamIdInput(e.target.value)}
+                            placeholder="ID камеры 1"
+                            className="w-32 px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="block text-xs text-slate-400">
+                          Привязка «Ворота №2» по уникальному ID камеры Дом.ру
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={cameras.some((c) => c.id === esp32Gate2CamIdInput) ? esp32Gate2CamIdInput : ''}
+                            onChange={(e) => {
+                              if (e.target.value) setEsp32Gate2CamIdInput(e.target.value);
+                            }}
+                            className="flex-1 min-w-0 px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                          >
+                            <option value="">Выбрать камеру из списка…</option>
+                            {cameras.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name} (ID {c.id})
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="text"
+                            value={esp32Gate2CamIdInput}
+                            onChange={(e) => setEsp32Gate2CamIdInput(e.target.value)}
+                            placeholder="ID камеры 2"
+                            className="w-32 px-3 py-2 text-xs font-mono rounded-xl bg-slate-50 dark:bg-[#12161f] border border-slate-200 dark:border-white/10"
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
                     <div className="space-y-1 sm:col-span-2">
                       <label className="block text-xs text-slate-400">
                         HTTP-адрес ESP32 (необязательно, если ESP32 сама опрашивает VPS)
@@ -3483,6 +3516,7 @@ export default function App() {
                     >
                       {esp32Saving ? 'Сохранение...' : 'Сохранить'}
                     </button>
+                    </div>
                   </form>
                 )}
 
@@ -3553,6 +3587,7 @@ void loop() {
                   </div>
                 )}
               </div>
+              )}
 
               {/* Personal Self-Hosted Guest Passes Card */}
               <div className="p-6 rounded-2xl bg-white dark:bg-[#1a202c] border border-slate-200/80 dark:border-white/[0.06] space-y-5">

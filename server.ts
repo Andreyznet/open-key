@@ -644,6 +644,9 @@ async function startServer() {
     deviceToken: string;
     gpioGate1Pin: number;
     gpioGate2Pin: number;
+    gate1CameraId: string;
+    gate2CameraId: string;
+    allowedPlaceIds: string[];
   }
 
   interface Esp32TriggerEvent {
@@ -668,6 +671,12 @@ async function startServer() {
     deviceToken: String(process.env.ESP32_DEVICE_TOKEN || 'openkey_esp32_gate_relay').trim(),
     gpioGate1Pin: 18,
     gpioGate2Pin: 19,
+    gate1CameraId: String(process.env.ESP32_GATE1_CAMERA_ID || '').trim(),
+    gate2CameraId: String(process.env.ESP32_GATE2_CAMERA_ID || '').trim(),
+    allowedPlaceIds: String(process.env.ESP32_ALLOWED_PLACE_IDS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
   };
 
   let esp32LastPollAt: number | null = null;
@@ -678,9 +687,19 @@ async function startServer() {
     try {
       const { value: parsed, wasPlaintext } = readEncryptedJsonFile<any>(ESP32_CONFIG_FILE);
       if (parsed && typeof parsed === 'object') {
+        const mergedPlaceIds = new Set<string>(esp32Config.allowedPlaceIds);
+        if (Array.isArray(parsed.allowedPlaceIds)) {
+          for (const id of parsed.allowedPlaceIds) {
+            const clean = String(id || '').trim();
+            if (clean) mergedPlaceIds.add(clean);
+          }
+        }
         esp32Config = {
           ...esp32Config,
           ...parsed,
+          gate1CameraId: String(parsed.gate1CameraId ?? esp32Config.gate1CameraId ?? '').trim(),
+          gate2CameraId: String(parsed.gate2CameraId ?? esp32Config.gate2CameraId ?? '').trim(),
+          allowedPlaceIds: Array.from(mergedPlaceIds),
           pulseDurationMs: Math.max(
             150,
             Math.min(5000, Number(parsed.pulseDurationMs ?? esp32Config.pulseDurationMs) || 600)
@@ -810,6 +829,7 @@ async function startServer() {
 
   const knownCameraMetaMap = new Map<string, KnownCameraMeta>();
   const knownLockMetaMap = new Map<string, KnownLockMeta>();
+  const knownPlaceAddressMap = new Map<string, string>();
   const eventCameraIdMap = new Map<string, string>();
 
   function rememberKnownCameraMeta(meta: KnownCameraMeta) {
@@ -936,6 +956,9 @@ async function startServer() {
                 accessControlId: null,
                 entranceId: null,
               });
+              if (c.placeAddress) {
+                rememberEsp32AuthorizedPlace(String(pid), c.placeAddress);
+              }
             }
           }
         }
@@ -990,6 +1013,9 @@ async function startServer() {
         accessControlId: null,
         entranceId: null,
       });
+      if (c.placeAddress) {
+        rememberEsp32AuthorizedPlace(pid, c.placeAddress);
+      }
     }
     placeCameraCatalog.set(pid, {
       placeId: pid,
@@ -1120,14 +1146,69 @@ async function startServer() {
     return null;
   }
 
-  function detectFacadeGateCamera(camName: string): {
+  function isEsp32TargetAddress(address?: string | null): boolean {
+    const norm = String(address || '')
+      .toLowerCase()
+      .replace(/ё/g, 'е')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!norm) return false;
+    // Cyrillic-safe word boundaries (JS \b only recognizes ASCII [a-zA-Z0-9_])
+    // Matches "3-й мкр, д. 6/б, кв. 85", "3-Й Мкр 6 б", "3 мкр 6б", etc.
+    const hasMicrodistrict3 = /(?:^|[^0-9а-яa-z])3(?:\s*[-]?\s*[йи])?\s*мкр(?:[^0-9а-яa-z]|$)/i.test(norm);
+    const hasBuilding6b = /(?:^|[^0-9а-яa-z])(?:д\.?\s*)?6\s*[/\\-]?\s*б(?:[^0-9а-яa-z]|$)/i.test(norm);
+    return hasMicrodistrict3 && hasBuilding6b;
+  }
+
+  function rememberEsp32AuthorizedPlace(placeId?: string | null, address?: string | null) {
+    const pid = String(placeId || '').trim();
+    if (!pid || pid === 'null') return;
+    const addr = String(address || '').trim();
+    if (addr) {
+      knownPlaceAddressMap.set(pid, addr);
+    }
+    if (isEsp32TargetAddress(addr)) {
+      if (!esp32Config.allowedPlaceIds.includes(pid)) {
+        esp32Config.allowedPlaceIds.push(pid);
+        saveEsp32ConfigToDisk();
+      }
+    }
+  }
+
+  function isEsp32AuthorizedPlace(placeId?: string | null, addressHint?: string | null): boolean {
+    if (!esp32Config.enabled) return false;
+    const pid = String(placeId || '').trim();
+    const addr = String(addressHint || (pid ? knownPlaceAddressMap.get(pid) : '') || '').trim();
+    if (addr && isEsp32TargetAddress(addr)) {
+      if (pid && pid !== 'null' && !esp32Config.allowedPlaceIds.includes(pid)) {
+        esp32Config.allowedPlaceIds.push(pid);
+        saveEsp32ConfigToDisk();
+      }
+      return true;
+    }
+    if (pid && pid !== 'null' && esp32Config.allowedPlaceIds.includes(pid)) {
+      return true;
+    }
+    return false;
+  }
+
+  function detectFacadeGateCamera(
+    camId: string | null | undefined,
+    camName: string,
+    placeAddress?: string | null,
+    placeId?: string | null
+  ): {
     channel: 1 | 2;
     accessControlId: string;
     entranceId: string;
     acLabel: string;
   } | null {
-    const lower = String(camName || '').toLowerCase();
-    if (lower.includes('фасад 1') || lower.includes('фасад №1') || lower.includes('ворота 1')) {
+    if (!esp32Config.enabled) return null;
+    const cleanCamId = String(camId || '').trim();
+
+    // 1. Exact Unique Dom.ru Camera ID match (globally unique per camera, immune to renames & cross-building leaks)
+    if (cleanCamId && esp32Config.gate1CameraId && cleanCamId === esp32Config.gate1CameraId) {
+      if (placeId) rememberEsp32AuthorizedPlace(placeId, placeAddress || '3-й мкр, д. 6/б');
       return {
         channel: 1,
         accessControlId: '990001',
@@ -1135,7 +1216,44 @@ async function startServer() {
         acLabel: 'Ворота №1',
       };
     }
-    if (lower.includes('фасад 2') || lower.includes('фасад №2') || lower.includes('ворота 2')) {
+    if (cleanCamId && esp32Config.gate2CameraId && cleanCamId === esp32Config.gate2CameraId) {
+      if (placeId) rememberEsp32AuthorizedPlace(placeId, placeAddress || '3-й мкр, д. 6/б');
+      return {
+        channel: 2,
+        accessControlId: '990002',
+        entranceId: 'esp32_gate_2',
+        acLabel: 'Ворота №2',
+      };
+    }
+
+    // 2. Fallback / initial auto-bind strictly for "3-й мкр, д. 6/б" when that channel's Camera ID is not yet set
+    if (!isEsp32AuthorizedPlace(placeId, placeAddress) && !isEsp32TargetAddress(camName)) {
+      return null;
+    }
+    const lower = String(camName || '').toLowerCase();
+    if (
+      !esp32Config.gate1CameraId &&
+      (lower.includes('фасад 1') || lower.includes('фасад №1') || lower.includes('ворота 1'))
+    ) {
+      if (cleanCamId) {
+        esp32Config.gate1CameraId = cleanCamId;
+        saveEsp32ConfigToDisk();
+      }
+      return {
+        channel: 1,
+        accessControlId: '990001',
+        entranceId: 'esp32_gate_1',
+        acLabel: 'Ворота №1',
+      };
+    }
+    if (
+      !esp32Config.gate2CameraId &&
+      (lower.includes('фасад 2') || lower.includes('фасад №2') || lower.includes('ворота 2'))
+    ) {
+      if (cleanCamId) {
+        esp32Config.gate2CameraId = cleanCamId;
+        saveEsp32ConfigToDisk();
+      }
       return {
         channel: 2,
         accessControlId: '990002',
@@ -1271,19 +1389,79 @@ async function startServer() {
     });
   });
 
-  app.get('/api/eg/esp32/status', (_req: Request, res: Response) => {
+  app.get('/api/eg/esp32/status', async (req: Request, res: Response) => {
+    const verified = await resolveVerifiedSession(req);
+    if (!verified.authenticated && !verified.isDemo) {
+      const ctx = extractContext(req);
+      if (ctx.accessToken) {
+        res.status(401).json({
+          error: 'unauthorized',
+          message: 'Сессия недействительна или истекла.',
+        });
+        return;
+      }
+    }
+
+    const ctx = extractContext(req);
+    const isAdmin = Boolean(verified.isOwner);
+    let hasEsp32Place = Boolean(verified.isDemo);
+    if (!isAdmin && !hasEsp32Place && ctx.accessToken && !ctx.accessToken.startsWith('demo_')) {
+      const cachedPlaces = verifiedTokenPlacesMap.get(ctx.accessToken);
+      if (cachedPlaces) {
+        for (const pid of cachedPlaces.placeIds) {
+          if (isEsp32AuthorizedPlace(pid)) {
+            hasEsp32Place = true;
+            break;
+          }
+        }
+      }
+    }
+
+    const authorized = isAdmin || hasEsp32Place;
     const now = Date.now();
     const activePending = esp32PendingCommands.filter((c) => c.timestamp >= now - 45000);
+
+    if (!authorized) {
+      res.json({
+        authorized: false,
+        isAdmin: false,
+        config: null,
+        lastPollAt: null,
+        pendingCommandsCount: 0,
+        recentTriggers: [],
+      });
+      return;
+    }
+
+    const exposedConfig = isAdmin
+      ? esp32Config
+      : {
+          ...esp32Config,
+          gate1HttpUrl: '',
+          gate2HttpUrl: '',
+          deviceToken: '',
+        };
+
     res.json({
-      config: esp32Config,
+      authorized: true,
+      isAdmin,
+      config: exposedConfig,
       lastPollAt: esp32LastPollAt,
       pendingCommandsCount: activePending.length,
-      recentTriggers: esp32RecentTriggers.slice(0, 15),
+      recentTriggers: isAdmin ? esp32RecentTriggers.slice(0, 15) : [],
     });
   });
 
   app.post('/api/eg/esp32/config', async (req: Request, res: Response) => {
-    if (!(await assertActiveSubscription(req, res))) return;
+    const accessState = await resolveBillingAccessState(req, res);
+    if (!accessState.allowed) return;
+    if (accessState.user?.role !== 'admin') {
+      res.status(403).json({
+        error: 'admin_required',
+        message: 'Изменение настроек контроллера ворот ESP32 доступно только администратору.',
+      });
+      return;
+    }
     const b = req.body || {};
     if (typeof b.enabled === 'boolean') esp32Config.enabled = b.enabled;
     if (b.mode === 'poll' || b.mode === 'http_direct' || b.mode === 'hybrid') {
@@ -1307,8 +1485,21 @@ async function startServer() {
     if (typeof b.gpioGate2Pin === 'number' && Number.isFinite(b.gpioGate2Pin)) {
       esp32Config.gpioGate2Pin = Math.max(0, Math.min(48, Math.round(b.gpioGate2Pin)));
     }
+    if (typeof b.gate1CameraId === 'string') {
+      esp32Config.gate1CameraId = b.gate1CameraId.trim().slice(0, 64);
+    }
+    if (typeof b.gate2CameraId === 'string') {
+      esp32Config.gate2CameraId = b.gate2CameraId.trim().slice(0, 64);
+    }
+    if (Array.isArray(b.allowedPlaceIds)) {
+      esp32Config.allowedPlaceIds = b.allowedPlaceIds
+        .map((id: any) => String(id || '').trim())
+        .filter(Boolean);
+    }
     saveEsp32ConfigToDisk();
     res.json({
+      authorized: true,
+      isAdmin: true,
       config: esp32Config,
       lastPollAt: esp32LastPollAt,
       pendingCommandsCount: esp32PendingCommands.length,
@@ -1694,6 +1885,8 @@ async function startServer() {
           placeObj?.address?.groupName ||
           `Объект #${placeId}`;
 
+        rememberEsp32AuthorizedPlace(placeId, addressStr);
+
         places.push({
           id: placeId,
           subscriberId: sp?.id,
@@ -2044,41 +2237,6 @@ async function startServer() {
         }
       }
 
-      // Attach ESP32 Gate Controller locks to "Камера фасад 1 - 3-Й Мкр 6 б" and "Камера фасад 2 - 3-Й Мкр 6 б"
-      for (const cam of dedupedCameras) {
-        const gateMeta = detectFacadeGateCamera(cam.name);
-        if (!gateMeta) continue;
-        cam.allowOpen = true;
-        if (!cam.accessControlId) cam.accessControlId = gateMeta.accessControlId;
-        if (!cam.entranceId) cam.entranceId = gateMeta.entranceId;
-
-        const alreadyHasGateLock = locks.some(
-          (l) =>
-            l.externalCameraId === cam.id ||
-            (String(l.placeId) === String(cam.placeId) &&
-              String(l.accessControlId) === gateMeta.accessControlId)
-        );
-        if (!alreadyHasGateLock) {
-          locks.push({
-            id: `lock_esp32_${cam.placeId}_gate_${gateMeta.channel}`,
-            placeId: cam.placeId,
-            placeAddress: cam.placeAddress,
-            accessControlId: gateMeta.accessControlId,
-            entranceId: gateMeta.entranceId,
-            name: cam.name,
-            acName: gateMeta.acLabel,
-            openable: true,
-            allowVideo: true,
-            externalCameraId: cam.id,
-            hidden: false,
-            favorite: true,
-            kind: 'gate',
-            controllerType: 'esp32',
-            esp32Channel: gateMeta.channel,
-          });
-        }
-      }
-
       const syncedUser = upsertBillingUserFromIdentity({
         phone: syncIdentity.phone,
         accountId: syncIdentity.accountId,
@@ -2124,6 +2282,41 @@ async function startServer() {
               }
             }
           }
+        }
+      }
+
+      // Attach ESP32 Gate Controller locks ONLY by unique bound Camera IDs or authorized building ("3-й мкр, д. 6/б")
+      for (const cam of dedupedCameras) {
+        const gateMeta = detectFacadeGateCamera(cam.id, cam.name, cam.placeAddress, cam.placeId);
+        if (!gateMeta) continue;
+        cam.allowOpen = true;
+        if (!cam.accessControlId) cam.accessControlId = gateMeta.accessControlId;
+        if (!cam.entranceId) cam.entranceId = gateMeta.entranceId;
+
+        const alreadyHasGateLock = locks.some(
+          (l) =>
+            l.externalCameraId === cam.id ||
+            (String(l.placeId) === String(cam.placeId) &&
+              String(l.accessControlId) === gateMeta.accessControlId)
+        );
+        if (!alreadyHasGateLock) {
+          locks.push({
+            id: `lock_esp32_${cam.placeId}_gate_${gateMeta.channel}`,
+            placeId: cam.placeId,
+            placeAddress: cam.placeAddress,
+            accessControlId: gateMeta.accessControlId,
+            entranceId: gateMeta.entranceId,
+            name: cam.name,
+            acName: gateMeta.acLabel,
+            openable: true,
+            allowVideo: true,
+            externalCameraId: cam.id,
+            hidden: false,
+            favorite: true,
+            kind: 'gate',
+            controllerType: 'esp32',
+            esp32Channel: gateMeta.channel,
+          });
         }
       }
 
@@ -2246,9 +2439,26 @@ async function startServer() {
         }
       }
 
-      // Check if this lock is an ESP32-controlled gate ("Камера фасад 1" / "Камера фасад 2")
+      // Check if this lock is an ESP32-controlled gate ("Камера фасад 1" / "Камера фасад 2" of 3-й мкр, д. 6/б)
       const esp32Channel = resolveEsp32ChannelFromLockParams(accessControlId, entranceId);
       if (esp32Channel !== null) {
+        if (!esp32Config.enabled || !isEsp32AuthorizedPlace(String(placeId))) {
+          res.status(403).json({
+            error: 'esp32_not_available',
+            message: 'Управление воротами через ESP32 доступно только для жильцов дома 3-й мкр, д. 6/б.',
+          });
+          return;
+        }
+        if (ctx.accessToken && !ctx.accessToken.startsWith('demo_')) {
+          const hasPlaceAccess = await ensureRequesterHasPlaceAccess(ctx, String(placeId));
+          if (!hasPlaceAccess) {
+            res.status(403).json({
+              error: 'place_access_denied',
+              message: 'Нет прав доступа к выбранному адресу для открытия ворот.',
+            });
+            return;
+          }
+        }
         const triggerEvent = await triggerEsp32Gate(esp32Channel);
         res.json({
           ok: true,
@@ -3669,15 +3879,22 @@ async function startServer() {
     const applyAliases = (list: GuestPassAccessControl[]) =>
       applyOwnerCameraAliasesToControls(list, ownerUserId, placeId);
 
-    let gate1CamId = lookupCachedPlaceControlCamera(placeId, 990001, 'esp32_gate_1');
-    let gate2CamId = lookupCachedPlaceControlCamera(placeId, 990002, 'esp32_gate_2');
+    const placeSupportsEsp32Gates = isEsp32AuthorizedPlace(placeId);
+
+    let gate1CamId = placeSupportsEsp32Gates
+      ? esp32Config.gate1CameraId || lookupCachedPlaceControlCamera(placeId, 990001, 'esp32_gate_1')
+      : null;
+    let gate2CamId = placeSupportsEsp32Gates
+      ? esp32Config.gate2CameraId || lookupCachedPlaceControlCamera(placeId, 990002, 'esp32_gate_2')
+      : null;
     let gate1DefaultName = 'Камера фасад 1 - 3-Й Мкр 6 б (Ворота №1)';
     let gate2DefaultName = 'Камера фасад 2 - 3-Й Мкр 6 б (Ворота №2)';
 
     const ensureGateCameraIds = async () => {
+      if (!placeSupportsEsp32Gates) return;
       if (gate1CamId && gate2CamId) return;
       try {
-        const fpRes = await egFetch('/rest/v1/forpost/cameras', ctx);
+        const fpRes = await egFetch('/rest/v1/forpost/cameras', ctx, { placeIdOverride: placeId });
         const fpList = fpRes.ok
           ? Array.isArray(fpRes.data)
             ? fpRes.data
@@ -3694,7 +3911,7 @@ async function startServer() {
           const cid = String(cam.ID ?? cam.id ?? cam.externalCameraId ?? cam.cameraId ?? '').trim();
           const cname = String(cam.Name || cam.name || cam.title || '');
           if (!cid || !cname) continue;
-          const gateMeta = detectFacadeGateCamera(cname);
+          const gateMeta = detectFacadeGateCamera(cid, cname, knownPlaceAddressMap.get(placeId), placeId);
           if (gateMeta?.channel === 1 && !gate1CamId) {
             gate1CamId = cid;
             gate1DefaultName = `${cname} (Ворота №1)`;
@@ -3765,26 +3982,31 @@ async function startServer() {
           });
         }
       }
-      await ensureGateCameraIds();
-      // Also include the 2 ESP32 Gate channels so guests can open gates if granted by owner
-      expanded.push(
-        {
-          id: 990001,
-          name: gate1DefaultName,
-          originalName: gate1DefaultName,
-          entranceId: 'esp32_gate_1',
-          cameraId: gate1CamId,
-        },
-        {
-          id: 990002,
-          name: gate2DefaultName,
-          originalName: gate2DefaultName,
-          entranceId: 'esp32_gate_2',
-          cameraId: gate2CamId,
-        }
-      );
+      if (placeSupportsEsp32Gates) {
+        await ensureGateCameraIds();
+        // Include the 2 ESP32 Gate channels strictly for the authorized building (3-й мкр, д. 6/б)
+        expanded.push(
+          {
+            id: 990001,
+            name: gate1DefaultName,
+            originalName: gate1DefaultName,
+            entranceId: 'esp32_gate_1',
+            cameraId: gate1CamId,
+          },
+          {
+            id: 990002,
+            name: gate2DefaultName,
+            originalName: gate2DefaultName,
+            entranceId: 'esp32_gate_2',
+            cameraId: gate2CamId,
+          }
+        );
+      }
       return applyAliases(expanded);
     } catch {
+      if (!placeSupportsEsp32Gates) {
+        return [];
+      }
       return applyAliases([
         {
           id: 990001,
@@ -4135,12 +4357,19 @@ async function startServer() {
           record.placeId
         )[0] || allowedControl;
 
-      // Check if this guest pass control is an ESP32 gate
+      // Check if this guest pass control is an ESP32 gate (only permitted for 3-й мкр, д. 6/б)
       const esp32Channel = resolveEsp32ChannelFromLockParams(
         resolvedControl.id,
         resolvedControl.entranceId
       );
       if (esp32Channel !== null) {
+        if (!esp32Config.enabled || !isEsp32AuthorizedPlace(record.placeId)) {
+          res.status(403).json({
+            error: 'esp32_not_available',
+            message: 'Открытие ворот через ESP32 недоступно для данного адреса.',
+          });
+          return;
+        }
         await triggerEsp32Gate(esp32Channel, `${resolvedControl.name} (Гостевой пропуск)`);
         record.openCount = (record.openCount || 0) + 1;
         record.lastOpenedAt = Date.now();
