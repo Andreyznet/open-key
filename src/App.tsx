@@ -2587,7 +2587,7 @@ export default function App() {
                         }}
                         onRequestFallbackEventMp4={(targetTs) => {
                           // Fallback to event MP4 if targetTs falls inside or close to a recorded event window
-                          const matched = findMatchingEventForTs(targetTs, cameraEvents, 120);
+                          const matched = findMatchingEventForTs(targetTs, cameraEvents, 180);
                           if (matched && activeVideoCamera.videoDownloadAvailable !== false) {
                             const endTs = matched.timestamp + Math.max(20, matched.duration || 30);
                             const offsetSec =

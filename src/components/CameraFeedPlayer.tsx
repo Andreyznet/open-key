@@ -198,6 +198,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
   const hudBarHoverRef = useRef<boolean>(false);
   const autoDvrFallbackKeyRef = useRef<string | null>(null);
   const autoMinSeekKeyRef = useRef<string | null>(null);
+  const dvrUnavailableRef = useRef<boolean>(false);
   const speedMenuRef = useRef<HTMLDivElement | null>(null);
   const infoMenuRef = useRef<HTMLDivElement | null>(null);
   const dateMenuRef = useRef<HTMLDivElement | null>(null);
@@ -250,8 +251,32 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
   const [downloadingMp4, setDownloadingMp4] = useState<boolean>(false);
   const [copiedUrl, setCopiedUrl] = useState<boolean>(false);
   const [reloadNonce, setReloadNonce] = useState<number>(0);
+  const [rulerWidthPx, setRulerWidthPx] = useState<number>(380);
+  const [rulerHoverInfo, setRulerHoverInfo] = useState<{
+    ts: number;
+    pct: number;
+    hasEvent: boolean;
+  } | null>(null);
 
   const effectiveMinAvailableTs = discoveredMinTs ?? knownMinAvailableTs ?? null;
+
+  // Keep ruler tick density consistent (~8px per 2-min tick) in both compact cards and wide fullscreen
+  useEffect(() => {
+    const el = rulerRef.current;
+    if (!el) return;
+    const updateWidth = () => {
+      const w = el.clientWidth;
+      if (w > 40) setRulerWidthPx(w);
+    };
+    updateWidth();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(updateWidth);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', updateWidth);
+    return () => window.removeEventListener('resize', updateWidth);
+  }, [isFullscreen, playbackMode]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -264,6 +289,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
     setDiscoveredMinTs(knownMinAvailableTs ?? null);
     setErrorMinTs(null);
     autoMinSeekKeyRef.current = null;
+    dvrUnavailableRef.current = false;
     setInternalEvents([]);
   }, [camera.id]);
 
@@ -604,24 +630,29 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
             setDiscoveredMinTs(minTs);
             setErrorMinTs(minTs);
             onDiscoverMinAvailableTs?.(camera.id, minTs, err?.minAvailableLabel);
-            if (
-              playbackMode === 'archive_stream' &&
-              archiveTimestampSec != null &&
-              archiveTimestampSec < minTs
-            ) {
-              if (onRequestFallbackEventMp4?.(archiveTimestampSec)) {
-                setLoading(false);
-                return;
-              }
-              const nearbyEvent = findBestEventNearTs(archiveTimestampSec, effectiveEvents, 120);
-              if (nearbyEvent && onOpenEvent) {
-                onCaptureNotice?.(
-                  `Открыта запись события (${formatClockHMS(nearbyEvent.timestamp)})`
-                );
-                onOpenEvent(nearbyEvent);
-                setLoading(false);
-                return;
-              }
+          } else if (playbackMode === 'archive_stream') {
+            dvrUnavailableRef.current = true;
+          }
+
+          if (
+            playbackMode === 'archive_stream' &&
+            archiveTimestampSec != null &&
+            (minTs == null || archiveTimestampSec < minTs)
+          ) {
+            if (onRequestFallbackEventMp4?.(archiveTimestampSec)) {
+              setLoading(false);
+              return;
+            }
+            const nearbyEvent = findBestEventNearTs(archiveTimestampSec, effectiveEvents, 180);
+            if (nearbyEvent && onOpenEvent) {
+              onCaptureNotice?.(
+                `Открыта запись события (${formatClockHMS(nearbyEvent.timestamp)})`
+              );
+              onOpenEvent(nearbyEvent);
+              setLoading(false);
+              return;
+            }
+            if (minTs != null) {
               const nowGuard = Math.floor(Date.now() / 1000) - 4;
               const autoSafeTs = Math.min(nowGuard, minTs + 6);
               const autoKey = `${camera.id}:${archiveTimestampSec}`;
@@ -641,6 +672,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
               }
             }
           }
+
           setError(
             err?.message ||
               (playbackMode === 'archive_stream'
@@ -783,13 +815,19 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
       onCaptureNotice?.('Архив недоступен для этой камеры на текущем тарифе');
       return;
     }
-    if (effectiveMinAvailableTs != null && clamped < effectiveMinAvailableTs) {
-      const nearby = findBestEventNearTs(clamped, effectiveEvents, 120);
+    if (
+      dvrUnavailableRef.current ||
+      (effectiveMinAvailableTs != null && clamped < effectiveMinAvailableTs)
+    ) {
+      const nearby = findBestEventNearTs(clamped, effectiveEvents, 240);
       if (nearby && onOpenEvent) {
         onOpenEvent(nearby);
         return;
       }
-      if (clamped >= effectiveMinAvailableTs - 120) {
+      if (
+        effectiveMinAvailableTs != null &&
+        clamped >= effectiveMinAvailableTs - 120
+      ) {
         const safeTarget = Math.min(nowLimitSec - 4, effectiveMinAvailableTs + 6);
         onSeekArchiveTimestamp?.(safeTarget);
         return;
@@ -857,9 +895,16 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
     commitArchiveScrub(stepTarget);
   };
 
-  // Interactive tick marks generated around current center timestamp
-  const rulerTicks = useMemo(() => {
-    const halfSpan = TIMELINE_SPAN_SEC / 2;
+  // Adapt visible timeline window to measured ruler width so tick spacing stays uniform (~8px per 2-min tick)
+  const visibleSpanSec = useMemo(() => {
+    if (rulerWidthPx <= 40) return TIMELINE_SPAN_SEC;
+    const computed = Math.round((rulerWidthPx / 8) * 120);
+    return Math.max(3600, Math.min(21600, computed));
+  }, [rulerWidthPx]);
+
+  // Interactive tick marks & continuous motion event spans around current center timestamp
+  const { rulerTicks, rulerEventSpans } = useMemo(() => {
+    const halfSpan = visibleSpanSec / 2;
     const minVisible = sliderDisplayTs - halfSpan;
     const maxVisible = sliderDisplayTs + halfSpan;
     const firstTick = Math.ceil(minVisible / 120) * 120; // every 2 minutes
@@ -877,8 +922,11 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
       const mins = d.getMinutes();
       const kind: 'major' | 'medium' | 'minor' =
         mins === 0 || mins === 30 ? 'major' : mins % 10 === 0 ? 'medium' : 'minor';
-      const pct = ((ts - minVisible) / TIMELINE_SPAN_SEC) * 100;
-      const hasEvent = effectiveEvents.some((ev) => Math.abs(ev.timestamp - ts) <= 90);
+      const pct = ((ts - minVisible) / visibleSpanSec) * 100;
+      const hasEvent = effectiveEvents.some((ev) => {
+        const endTs = ev.timestamp + Math.max(20, ev.duration || 30);
+        return ts >= ev.timestamp - 60 && ts <= endTs + 60;
+      });
       ticks.push({
         ts,
         pct,
@@ -888,8 +936,26 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
         hasEvent,
       });
     }
-    return ticks;
-  }, [sliderDisplayTs, liveNowSec, effectiveEvents]);
+
+    const spans: Array<{ id: string; leftPct: number; widthPct: number }> = [];
+    for (const ev of effectiveEvents) {
+      const startTs = ev.timestamp;
+      const endTs = ev.timestamp + Math.max(25, ev.duration || 30);
+      if (endTs < minVisible || startTs > maxVisible) continue;
+      const clampedStart = Math.max(minVisible, startTs);
+      const clampedEnd = Math.min(maxVisible, Math.min(liveNowSec, endTs));
+      if (clampedEnd <= clampedStart) continue;
+      const leftPct = ((clampedStart - minVisible) / visibleSpanSec) * 100;
+      const rawWidthPct = ((clampedEnd - clampedStart) / visibleSpanSec) * 100;
+      spans.push({
+        id: ev.id,
+        leftPct,
+        widthPct: Math.max(rawWidthPct, 0.5),
+      });
+    }
+
+    return { rulerTicks: ticks, rulerEventSpans: spans };
+  }, [sliderDisplayTs, liveNowSec, effectiveEvents, visibleSpanSec]);
 
   const canArchiveInteractive =
     canViewArchive && Boolean(onSeekArchiveTimestamp || onOpenEvent);
@@ -1520,34 +1586,46 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
 
       {/* Floating Door / Gate Open Button (Right side above bottom dock) */}
       {linkedLock && canOpenLock && onOpenLock && (
-        <button
-          type="button"
-          disabled={isUnlocking}
-          onClick={(e) => {
-            e.stopPropagation();
-            triggerHudActivity();
-            onOpenLock(linkedLock);
-          }}
-          title={`Открыть: ${linkedLock.name}`}
-          className={`absolute right-2.5 sm:right-4 bottom-[54px] sm:bottom-[68px] z-20 px-3.5 py-2 sm:px-5 sm:py-2.5 rounded-full text-xs sm:text-sm font-semibold text-white shadow-xl inline-flex items-center gap-1.5 sm:gap-2 transition-all active:scale-95 cursor-pointer ${
-            doorUnlockedPulse
-              ? 'bg-emerald-500 hover:bg-emerald-600 shadow-emerald-950/40'
-              : isUnlocking
-                ? 'bg-[#2563EB]/80 cursor-wait'
-                : 'bg-[#2563EB] hover:bg-blue-700 shadow-blue-950/50'
+        <div
+          className={`pointer-events-none absolute inset-x-0 bottom-[58px] sm:bottom-[70px] z-20 px-2.5 sm:px-4 ${
+            isFullscreen ? 'sm:px-6' : ''
           }`}
         >
-          {isUnlocking ? (
-            <RefreshCw className="w-3.5 h-3.5 sm:w-4 sm:h-4 animate-spin" />
-          ) : doorUnlockedPulse ? (
-            <Unlock className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-          ) : (
-            <Lock className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-          )}
-          <span>
-            {isUnlocking ? 'Открытие...' : doorUnlockedPulse ? 'Открыто' : 'Открыть'}
-          </span>
-        </button>
+          <div
+            className={`flex justify-end ${
+              isFullscreen ? 'max-w-6xl mx-auto' : ''
+            }`}
+          >
+            <button
+              type="button"
+              disabled={isUnlocking}
+              onClick={(e) => {
+                e.stopPropagation();
+                triggerHudActivity();
+                onOpenLock(linkedLock);
+              }}
+              title={`Открыть: ${linkedLock.name}`}
+              className={`pointer-events-auto px-3.5 py-2 sm:px-5 sm:py-2.5 rounded-full text-xs sm:text-sm font-semibold text-white shadow-xl inline-flex items-center gap-1.5 sm:gap-2 transition-all active:scale-95 cursor-pointer ${
+                doorUnlockedPulse
+                  ? 'bg-emerald-500 hover:bg-emerald-600 shadow-emerald-950/40'
+                  : isUnlocking
+                    ? 'bg-[#2563EB]/80 cursor-wait'
+                    : 'bg-[#2563EB] hover:bg-blue-700 shadow-blue-950/50'
+              }`}
+            >
+              {isUnlocking ? (
+                <RefreshCw className="w-3.5 h-3.5 sm:w-4 sm:h-4 animate-spin" />
+              ) : doorUnlockedPulse ? (
+                <Unlock className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              ) : (
+                <Lock className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              )}
+              <span>
+                {isUnlocking ? 'Открытие...' : doorUnlockedPulse ? 'Открыто' : 'Открыть'}
+              </span>
+            </button>
+          </div>
+        </div>
       )}
 
       {/* Bottom Floating Control Dock (Prev/Play/Next + Scrubbing Timeline + Live + Date) */}
@@ -1560,20 +1638,26 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
           hudBarHoverRef.current = false;
         }}
         onClick={(e) => e.stopPropagation()}
-        className={`absolute inset-x-0 bottom-0 pt-10 pb-2 sm:pb-3.5 px-2 sm:px-4 bg-gradient-to-t from-black/90 via-black/45 to-transparent transition-all duration-200 z-20 ${
+        className={`absolute inset-x-0 bottom-0 pt-10 pb-2 sm:pb-3.5 px-2 sm:px-4 ${
+          isFullscreen ? 'sm:px-6 sm:pb-5' : ''
+        } bg-gradient-to-t from-black/90 via-black/45 to-transparent transition-all duration-200 z-20 ${
           showControls
             ? 'opacity-100 translate-y-0'
             : 'opacity-0 translate-y-1 pointer-events-none'
         }`}
       >
-        <div className="flex items-center gap-1.5 sm:gap-2.5">
+        <div
+          className={`flex items-center gap-1.5 sm:gap-2.5 ${
+            isFullscreen ? 'max-w-6xl mx-auto' : ''
+          }`}
+        >
           {/* Left Transport Buttons: Prev Event | Play/Pause | Next Event */}
           <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
             <button
               type="button"
               disabled={!canArchiveInteractive}
               onClick={handleStepPrev}
-              className="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-slate-950/85 hover:bg-slate-900 disabled:opacity-35 disabled:cursor-not-allowed border border-white/15 backdrop-blur-md text-white flex items-center justify-center shadow-lg transition-colors cursor-pointer"
+              className="w-9 h-9 sm:w-11 sm:h-11 rounded-full bg-slate-950/85 hover:bg-slate-900 disabled:opacity-35 disabled:cursor-not-allowed border border-white/15 backdrop-blur-md text-white flex items-center justify-center shadow-lg transition-colors cursor-pointer"
               title="Предыдущее событие / назад"
             >
               <SkipBack className="w-3.5 h-3.5 sm:w-4 sm:h-4 fill-current" />
@@ -1582,7 +1666,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
             <button
               type="button"
               onClick={handleTogglePlayPause}
-              className="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-white hover:bg-slate-100 text-slate-900 flex items-center justify-center shadow-lg transition-colors cursor-pointer"
+              className="w-9 h-9 sm:w-11 sm:h-11 rounded-full bg-white hover:bg-slate-100 text-slate-900 flex items-center justify-center shadow-lg transition-colors cursor-pointer"
               title={isPaused ? 'Воспроизвести' : 'Пауза'}
             >
               {isPaused ? (
@@ -1596,7 +1680,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
               type="button"
               disabled={playbackMode === 'live' || !canArchiveInteractive}
               onClick={handleStepNext}
-              className="hidden sm:flex w-10 h-10 rounded-full bg-slate-950/85 hover:bg-slate-900 disabled:opacity-35 disabled:cursor-not-allowed border border-white/15 backdrop-blur-md text-white items-center justify-center shadow-lg transition-colors cursor-pointer"
+              className="hidden sm:flex w-11 h-11 rounded-full bg-slate-950/85 hover:bg-slate-900 disabled:opacity-35 disabled:cursor-not-allowed border border-white/15 backdrop-blur-md text-white items-center justify-center shadow-lg transition-colors cursor-pointer"
               title="Следующее событие / вперёд"
             >
               <SkipForward className="w-4 h-4 fill-current" />
@@ -1604,12 +1688,10 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
           </div>
 
           {/* Center Interactive Tick Timeline Capsule */}
-          <div className="flex-1 min-w-0 h-8 sm:h-10 rounded-full bg-slate-950/85 border border-white/15 backdrop-blur-md px-1.5 sm:px-2 flex items-center gap-1.5 sm:gap-2.5 shadow-lg">
+          <div className="relative flex-1 min-w-0 h-9 sm:h-11 rounded-full bg-slate-950/85 border border-white/15 backdrop-blur-md px-1.5 sm:px-2 flex items-center gap-1.5 sm:gap-2.5 shadow-lg">
             {/* Live / Archive Clock Readout */}
             <span className="px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-full bg-white/[0.09] text-[10px] sm:text-xs font-mono tabular-nums text-white shrink-0">
-              {playbackMode === 'event_mp4' && activeEventId
-                ? formatClockHMS(sliderDisplayTs)
-                : formatClockHMS(sliderDisplayTs)}
+              {formatClockHMS(sliderDisplayTs)}
             </span>
 
             {/* Draggable Tick-Mark Ruler */}
@@ -1641,6 +1723,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
                 onPointerDown={(e) => {
                   if (!canArchiveInteractive) return;
                   triggerHudActivity();
+                  setRulerHoverInfo(null);
                   const rect = e.currentTarget.getBoundingClientRect();
                   e.currentTarget.setPointerCapture(e.pointerId);
                   dragStateRef.current = {
@@ -1653,20 +1736,42 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
                 }}
                 onPointerMove={(e) => {
                   const st = dragStateRef.current;
-                  if (!st) return;
-                  const dx = e.clientX - st.startX;
-                  if (Math.abs(dx) > 4) {
-                    st.hasDragged = true;
+                  if (st) {
+                    const dx = e.clientX - st.startX;
+                    if (Math.abs(dx) > 4) {
+                      st.hasDragged = true;
+                    }
+                    if (st.hasDragged) {
+                      const deltaSec = Math.round(
+                        (dx / Math.max(100, st.rulerWidth)) * visibleSpanSec
+                      );
+                      const nextTs = Math.max(
+                        retentionMinSec,
+                        Math.min(nowLimitSec, st.startCenterTs - deltaSec)
+                      );
+                      setScrubPreviewTs(nextTs);
+                    }
+                    return;
                   }
-                  if (st.hasDragged) {
-                    const deltaSec = Math.round(
-                      (dx / Math.max(100, st.rulerWidth)) * TIMELINE_SPAN_SEC
-                    );
-                    const nextTs = Math.max(
-                      retentionMinSec,
-                      Math.min(nowLimitSec, st.startCenterTs - deltaSec)
-                    );
-                    setScrubPreviewTs(nextTs);
+                  if (!canArchiveInteractive || e.pointerType === 'touch') return;
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pct = Math.max(
+                    0,
+                    Math.min(100, ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100)
+                  );
+                  const hoverTs = Math.floor(
+                    sliderDisplayTs + (pct / 100 - 0.5) * visibleSpanSec
+                  );
+                  if (hoverTs > liveNowSec || hoverTs < retentionMinSec) {
+                    setRulerHoverInfo(null);
+                    return;
+                  }
+                  const hasEv = Boolean(findBestEventNearTs(hoverTs, effectiveEvents, 90));
+                  setRulerHoverInfo({ ts: hoverTs, pct, hasEvent: hasEv });
+                }}
+                onPointerLeave={() => {
+                  if (!dragStateRef.current) {
+                    setRulerHoverInfo(null);
                   }
                 }}
                 onPointerUp={(e) => {
@@ -1685,7 +1790,7 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
                   } else {
                     const rect = e.currentTarget.getBoundingClientRect();
                     const frac = (e.clientX - rect.left) / Math.max(1, rect.width) - 0.5;
-                    const clickedTs = st.startCenterTs + Math.round(frac * TIMELINE_SPAN_SEC);
+                    const clickedTs = st.startCenterTs + Math.round(frac * visibleSpanSec);
                     commitArchiveScrub(clickedTs);
                   }
                 }}
@@ -1702,51 +1807,93 @@ export const CameraFeedPlayer: React.FC<CameraFeedPlayerProps> = ({
                 }}
                 title={
                   canArchiveInteractive
-                    ? 'Потяните или нажмите на шкалу для перехода к нужному времени'
+                    ? 'Синие метки — движение. Потяните или нажмите на шкалу для перехода.'
                     : 'Архив недоступен'
                 }
-                className={`relative flex-1 h-full overflow-hidden select-none touch-none ${
+                className={`relative flex-1 h-full select-none touch-none ${
                   canArchiveInteractive
                     ? 'cursor-grab active:cursor-grabbing'
                     : 'opacity-45 cursor-not-allowed'
                 }`}
               >
-                {/* Tick Marks + Half-Hour Labels */}
-                {rulerTicks.map((tick) => (
+                {/* Hover Time & Motion Tooltip */}
+                {rulerHoverInfo && scrubPreviewTs === null && (
                   <div
-                    key={tick.ts}
-                    style={{ left: `${tick.pct}%` }}
-                    className="absolute inset-y-0 -translate-x-1/2 flex flex-col items-center pointer-events-none"
+                    style={{ left: `${rulerHoverInfo.pct}%` }}
+                    className="hidden sm:flex items-center gap-1.5 -translate-x-1/2 -top-7 absolute px-2 py-0.5 rounded-full bg-slate-950/95 border border-white/15 text-[10px] font-mono tabular-nums text-white shadow-lg pointer-events-none whitespace-nowrap z-30"
                   >
-                    <div
-                      className={`mt-1.5 sm:mt-2 w-[1.5px] rounded-full ${
-                        tick.kind === 'major'
-                          ? 'h-4 sm:h-5'
-                          : tick.kind === 'medium'
-                            ? 'h-3 sm:h-3.5'
-                            : 'h-2 sm:h-2.5'
-                      } ${
-                        tick.isFuture
-                          ? 'bg-white/20'
-                          : tick.hasEvent
-                            ? 'bg-[#3B82F6]'
-                            : 'bg-white/80'
-                      }`}
-                    />
-                    {tick.label && (
-                      <span
-                        className={`text-[9px] font-mono tabular-nums leading-none mt-0.5 ${
-                          tick.isFuture ? 'text-white/30' : 'text-white/75'
-                        }`}
+                    {rulerHoverInfo.hasEvent && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-[#3B82F6] shrink-0" />
+                    )}
+                    <span>{formatClockHMS(rulerHoverInfo.ts)}</span>
+                  </div>
+                )}
+
+                <div className="relative w-full h-full overflow-hidden">
+                  {/* Top Tick Strip (Strictly above time labels so playhead never crosses labels) */}
+                  <div className="absolute inset-x-0 top-1.5 bottom-[14px]">
+                    {/* Motion Event Highlight Bars along base of tick strip */}
+                    {rulerEventSpans.map((span) => (
+                      <div
+                        key={span.id}
+                        style={{
+                          left: `${span.leftPct}%`,
+                          width: `${span.widthPct}%`,
+                          minWidth: '4px',
+                        }}
+                        className="absolute bottom-0 h-[3px] rounded-full bg-[#3B82F6] shadow-[0_0_6px_rgba(59,130,246,0.85)] pointer-events-none"
+                      />
+                    ))}
+
+                    {rulerTicks.map((tick) => (
+                      <div
+                        key={`t-${tick.ts}`}
+                        style={{ left: `${tick.pct}%` }}
+                        className="absolute inset-y-0 -translate-x-1/2 flex items-center pointer-events-none"
                       >
-                        {tick.label}
-                      </span>
+                        <div
+                          className={`rounded-full ${
+                            tick.hasEvent && !tick.isFuture ? 'w-[2px]' : 'w-[1.5px]'
+                          } ${
+                            tick.kind === 'major'
+                              ? 'h-full'
+                              : tick.kind === 'medium'
+                                ? 'h-[72%]'
+                                : 'h-[45%]'
+                          } ${
+                            tick.isFuture
+                              ? 'bg-white/20'
+                              : tick.hasEvent
+                                ? 'bg-[#60A5FA]'
+                                : 'bg-white/80'
+                          }`}
+                        />
+                      </div>
+                    ))}
+
+                    {/* Center Vertical Playhead + Top Dot */}
+                    <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-[2px] rounded-full bg-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.95)] pointer-events-none">
+                      <span className="absolute -top-1 left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-[#60A5FA]" />
+                    </div>
+                  </div>
+
+                  {/* Bottom Time Labels Band */}
+                  <div className="absolute inset-x-0 bottom-[2px] h-[11px] pointer-events-none">
+                    {rulerTicks.map((tick) =>
+                      tick.label && tick.pct >= 7 && tick.pct <= 93 ? (
+                        <span
+                          key={`l-${tick.ts}`}
+                          style={{ left: `${tick.pct}%` }}
+                          className={`absolute top-0 -translate-x-1/2 text-[9px] font-mono tabular-nums leading-none whitespace-nowrap ${
+                            tick.isFuture ? 'text-white/30' : 'text-white/75'
+                          }`}
+                        >
+                          {tick.label}
+                        </span>
+                      ) : null
                     )}
                   </div>
-                ))}
-
-                {/* Center Vertical Playhead */}
-                <div className="absolute inset-y-1 left-1/2 -translate-x-1/2 w-[2px] rounded-full bg-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.95)] pointer-events-none" />
+                </div>
               </div>
             )}
 
